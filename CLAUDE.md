@@ -114,6 +114,74 @@ When users ask about order status:
 - Use `get_request_status("REQ...")` or `get_request_status("RITM...")`
 - Use `list_my_requests("user@example.com")` to see all requests for a user
 
+## Pre-Flight Validation Workflow
+
+When creating ANY record (incidents, change requests, catalog orders, etc.), follow this validation workflow:
+
+### 1. Discover Mandatory Fields FIRST
+Before creating a record, call `get_form_mandatory_fields` to discover ALL required fields:
+
+```
+get_form_mandatory_fields("incident")
+```
+
+This returns:
+- Dictionary mandatory fields (always required)
+- UI Policy mandatory fields (conditionally required)
+- Conditions for when fields become mandatory
+
+### 2. Collect All Required Data
+Based on the mandatory fields discovered:
+- Ask the user for any missing required fields
+- Explain which fields are mandatory and why
+- For UI Policy fields, explain the conditions
+
+### 3. Validate BEFORE Submission
+Always call `validate_record_data` before creating records:
+
+```
+validate_record_data(
+    "incident",
+    '{"short_description": "...", "caller_id": "...", "priority": "1"}',
+    strict_mode=True
+)
+```
+
+### 4. Only Submit If Validation Passes
+If `validate_record_data` returns `"valid": true`, proceed with creation.
+If validation fails, report the missing fields to the user and ask for them.
+
+### Example Validation Flow
+
+```
+User: "Create a P1 incident for database outage"
+
+Claude:
+1. Calls get_form_mandatory_fields("incident")
+2. Sees: short_description, caller_id, impact (for P1) are required
+3. Asks: "I need a few more details:
+   - Who is the caller?
+   - What's the impact? (1-3)"
+4. User provides: caller=john@example.com, impact=1
+5. Calls validate_record_data with all fields
+6. Validation passes ✅
+7. Calls create_incident
+8. Reports success
+```
+
+## Record Creation Best Practices
+
+✅ **DO:**
+- Always discover mandatory fields first (`get_form_mandatory_fields`)
+- Always validate before submission (`validate_record_data`)
+- Ask for missing fields with clear explanations
+- Use `strict_mode=True` for critical records
+
+❌ **DON'T:**
+- Submit records without validation
+- Ignore UI Policy mandatory fields
+- Assume field requirements (they vary by table and conditions)
+
 ## Important Notes
 
 - The MCP server authenticates as `claude.desktop` (service account)
