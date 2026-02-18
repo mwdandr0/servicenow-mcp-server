@@ -1,14 +1,15 @@
 """
 Horizon-specific entrypoint for ServiceNow MCP Server
 
-This entrypoint is designed specifically for Prefect Horizon deployments.
-It simply imports and exports the mcp instance without trying to run it.
+This entrypoint exports an ASGI application for Horizon deployment.
+Horizon runs MCP servers over HTTP using ASGI, not stdio.
 """
 
 # Import the mcp server instance from server.py
 from server import mcp
 
-# Horizon will handle running the server
-# No need to call mcp.run() here - that's what causes the asyncio conflict
+# Export ASGI app for Horizon to run
+# This uses HTTP transport instead of stdio, avoiding asyncio conflicts
+app = mcp.http_app()
 
-__all__ = ['mcp']
+__all__ = ['app']
