@@ -4659,10 +4659,27 @@ def analyze_conversation_performance(
             pass
         return 0
 
+    # Helper to parse ServiceNow timestamps (supports multiple formats)
+    def parse_sn_timestamp(ts_str):
+        """Parse ServiceNow timestamp - tries MM/DD/YYYY and YYYY-MM-DD formats."""
+        if not ts_str:
+            return None
+        ts_str = ts_str.strip()
+        # Try common ServiceNow formats
+        for fmt in ["%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M"]:
+            try:
+                return datetime.strptime(ts_str, fmt)
+            except ValueError:
+                continue
+        return None
+
     # Build timeline entries (collect first, then sort by timestamp)
     timeline_entries = []
     react_logs_sorted = [log for log in gen_ai_logs if 'ReAct' in get_value(log.get('definition', ''))]
     react_logs_sorted.sort(key=lambda x: get_value(x.get('started_at', x.get('sys_created_on', ''))))
+
+    # Track total user wait time for bottleneck analysis
+    total_user_wait_seconds = 0
 
     if execution_tasks:
         for i, task in enumerate(execution_tasks):
@@ -4720,20 +4737,18 @@ def analyze_conversation_performance(
                 elif "get user input" in description.lower():
                     # Calculate user wait time - gap from previous task's COMPLETION to user input
                     wait_sec = None
-                    from datetime import datetime, timedelta
 
-                    if start_time_str:
-                        try:
-                            user_input_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
+                    user_input_time = parse_sn_timestamp(start_time_str)
+                    if user_input_time:
+                        # Look backwards for nearest preceding task with execution_time_ms
+                        for j in range(i - 1, -1, -1):
+                            prev_task = execution_tasks[j]
+                            prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
+                            prev_duration_str = get_value(prev_task.get('execution_time_ms'))
 
-                            # Look backwards for nearest preceding task with execution_time_ms (Gen AI or Tool)
-                            for j in range(i - 1, -1, -1):
-                                prev_task = execution_tasks[j]
-                                prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
-                                prev_duration_str = get_value(prev_task.get('execution_time_ms'))
-
-                                if prev_start and prev_duration_str:
-                                    prev_start_time = datetime.strptime(prev_start, "%Y-%m-%d %H:%M:%S")
+                            if prev_start and prev_duration_str:
+                                prev_start_time = parse_sn_timestamp(prev_start)
+                                if prev_start_time:
                                     prev_duration_ms = parse_number(prev_duration_str)
 
                                     if prev_duration_ms > 0:
@@ -4745,23 +4760,23 @@ def analyze_conversation_performance(
                                             wait_sec = int(gap_sec)
                                             break
 
-                            # Fallback: gap from previous task's start_time if no duration available
-                            if wait_sec is None or wait_sec <= 0:
-                                for j in range(i - 1, -1, -1):
-                                    prev_task = execution_tasks[j]
-                                    prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
-                                    if prev_start:
-                                        prev_time = datetime.strptime(prev_start, "%Y-%m-%d %H:%M:%S")
+                        # Fallback: gap from previous task's start_time if no duration available
+                        if wait_sec is None or wait_sec <= 0:
+                            for j in range(i - 1, -1, -1):
+                                prev_task = execution_tasks[j]
+                                prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
+                                if prev_start:
+                                    prev_time = parse_sn_timestamp(prev_start)
+                                    if prev_time:
                                         gap = (user_input_time - prev_time).total_seconds()
                                         if gap > 0:
                                             wait_sec = int(gap)
                                             break
-                        except:
-                            pass
 
-                    # Format timeline entry
+                    # Format timeline entry and accumulate total wait
                     if wait_sec and wait_sec >= 2:
                         display_line = f"[{time_only}] 👤 User wait — user input (~{wait_sec}s)"
+                        total_user_wait_seconds += wait_sec  # Accumulate for bottleneck analysis
                     else:
                         display_line = f"[{time_only}] 👤 User input requested"
                 else:
@@ -4813,60 +4828,28 @@ def analyze_conversation_performance(
         total_llm_ms = sum(parse_number(get_value(log.get('time_taken'))) for log in gen_ai_logs)
         total_tool_ms = sum(parse_number(get_value(tool.get('execution_time_ms'))) for tool in tool_executions)
 
-        # Calculate total user wait time
-        total_user_wait_ms = 0
-        if execution_tasks:
-            from datetime import datetime, timedelta
-            for i, task in enumerate(execution_tasks):
-                description = get_value(task.get('description', ''))
-                if "get user input" in description.lower() or "user input" in description.lower():
-                    start_time_str = get_value(task.get('start_time')) or get_value(task.get('sys_created_on', ''))
-                    if start_time_str:
-                        try:
-                            user_input_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
-                            wait_ms = None
+        # System time total (not including user wait)
+        system_total_ms = total_llm_ms + total_tool_ms
 
-                            # Look backwards for nearest preceding task with execution_time_ms
-                            for j in range(i - 1, -1, -1):
-                                prev_task = execution_tasks[j]
-                                prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
-                                prev_duration_str = get_value(prev_task.get('execution_time_ms'))
+        if system_total_ms > 0:
+            llm_pct = (total_llm_ms / system_total_ms) * 100
+            tool_pct = (total_tool_ms / system_total_ms) * 100
 
-                                if prev_start and prev_duration_str:
-                                    prev_start_time = datetime.strptime(prev_start, "%Y-%m-%d %H:%M:%S")
-                                    prev_duration_ms = parse_number(prev_duration_str)
-
-                                    if prev_duration_ms > 0:
-                                        prev_completion = prev_start_time + timedelta(milliseconds=prev_duration_ms)
-                                        gap_ms = (user_input_time - prev_completion).total_seconds() * 1000
-                                        if gap_ms > 0:
-                                            wait_ms = gap_ms
-                                            break
-
-                            if wait_ms and wait_ms > 2000:  # Only count if > 2 seconds
-                                total_user_wait_ms += int(wait_ms)
-                        except:
-                            pass
-
-        # Estimate total (this is processing time, not wall clock)
-        total_processing_ms = total_llm_ms + total_tool_ms
-
-        if total_processing_ms > 0:
-            llm_pct = (total_llm_ms / total_processing_ms) * 100
-            tool_pct = (total_tool_ms / total_processing_ms) * 100
-
-            output.append(f"TOTAL SYSTEM TIME: {total_processing_ms:,} ms ({total_processing_ms/1000:.1f}s)")
+            output.append(f"TOTAL SYSTEM TIME: {system_total_ms:,} ms ({system_total_ms/1000:.1f}s)")
             output.append("")
             output.append("Time Breakdown:")
             output.append(f"  LLM Processing:  {total_llm_ms:,} ms ({llm_pct:.1f}%)")
             output.append(f"  Tool Execution:  {total_tool_ms:,} ms ({tool_pct:.1f}%)")
 
             # Add user wait time if present (not included in percentages)
-            if total_user_wait_ms > 0:
-                output.append(f"  User Wait:       ~{total_user_wait_ms // 1000}s (not included in system time)")
-                total_wall_clock_sec = (total_processing_ms + total_user_wait_ms) // 1000
-                output.append("")
-                output.append(f"Total Wall Clock: ~{total_wall_clock_sec}s (including user wait)")
+            if total_user_wait_seconds >= 2:
+                output.append(f"  User Wait:       ~{total_user_wait_seconds}s (not included in system time)")
+
+            # Add total wall clock if user wait present
+            if total_user_wait_seconds >= 2:
+                total_user_wait_ms = total_user_wait_seconds * 1000
+                wall_clock_seconds = (system_total_ms + total_user_wait_ms) / 1000
+                output.append(f"  Total Wall Clock:  ~{wall_clock_seconds:.0f}s (incl. user wait)")
 
             output.append("")
 
