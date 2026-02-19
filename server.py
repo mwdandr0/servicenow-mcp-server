@@ -4199,6 +4199,20 @@ def analyze_conversation_performance(
     if not actual_conversation_sys_id:
         return "Error: Could not resolve conversation_sys_id from input. Please provide valid conversation or execution_plan sys_id."
 
+    # Query execution plan again with display_value=true for reference fields
+    execution_plan_display = None
+    if execution_plan_id:
+        ep_display_result = client.table_get(
+            table="sn_aia_execution_plan",
+            query=f"sys_id={execution_plan_id}",
+            fields=["sys_id", "objective", "state", "team", "derived_scope", "execution_mode",
+                    "start_time", "end_time", "sys_created_on"],
+            limit=1,
+            display_value="true"  # Get display values for reference fields
+        )
+        if ep_display_result["success"] and ep_display_result["data"].get("result"):
+            execution_plan_display = ep_display_result["data"]["result"][0]
+
     # ========================================================================
     # STEP 2: DATA COLLECTION (7 Tables)
     # ========================================================================
@@ -4292,7 +4306,8 @@ def analyze_conversation_performance(
         msg_result = client.table_get(
             table="sn_aia_message",
             query=f"execution_plan={execution_plan_id}",
-            fields=["sys_id", "sys_created_on", "role", "content"],
+            fields=["sys_id", "sys_created_on", "role", "message", "user_message", "name",
+                    "type", "message_sequence", "error_type"],
             limit=50,
             order_by="sys_created_on",
             display_value="true"
@@ -4324,7 +4339,13 @@ def analyze_conversation_performance(
     output.append(f"Conversation: {actual_conversation_sys_id}")
     output.append(f"Execution Plan: {execution_plan_id or 'N/A'}")
 
-    if execution_plan:
+    # Use execution_plan_display for reference fields (team, derived_scope) to get display values
+    if execution_plan_display:
+        output.append(f"Objective: {get_value(execution_plan_display.get('objective', 'N/A'))}")
+        output.append(f"State: {get_value(execution_plan_display.get('state', 'N/A'))}")
+        output.append(f"Scope: {get_value(execution_plan_display.get('derived_scope', 'N/A'))}")
+        output.append(f"Team: {get_value(execution_plan_display.get('team', 'N/A'))}")
+    elif execution_plan:
         output.append(f"Objective: {get_value(execution_plan.get('objective', 'N/A'))}")
         output.append(f"State: {get_value(execution_plan.get('state', 'N/A'))}")
         output.append(f"Scope: {get_value(execution_plan.get('derived_scope', 'N/A'))}")
@@ -4360,6 +4381,9 @@ def analyze_conversation_performance(
     output.append("=" * 80)
 
     if gen_ai_logs:
+        # Sort gen_ai_logs by started_at chronologically
+        gen_ai_logs.sort(key=lambda x: get_value(x.get('started_at', x.get('sys_created_on', ''))))
+
         total_prompt_tokens = sum(parse_number(get_value(log.get('prompt_token_count'))) for log in gen_ai_logs)
         total_response_tokens = sum(parse_number(get_value(log.get('response_token_count'))) for log in gen_ai_logs)
         total_llm_time = sum(parse_number(get_value(log.get('time_taken'))) for log in gen_ai_logs)
@@ -4426,6 +4450,9 @@ def analyze_conversation_performance(
         # Prompt token growth analysis (ReAct Engine)
         react_logs = [log for log in gen_ai_logs if 'ReAct' in get_value(log.get('definition', ''))]
         if len(react_logs) >= 2:
+            # Sort by started_at ascending to get first and last chronologically
+            react_logs.sort(key=lambda x: get_value(x.get('started_at', x.get('sys_created_on', ''))))
+
             first_prompt = parse_number(get_value(react_logs[0].get('prompt_token_count')))
             last_prompt = parse_number(get_value(react_logs[-1].get('prompt_token_count')))
             if first_prompt > 0:
@@ -4435,7 +4462,7 @@ def analyze_conversation_performance(
                 output.append(f"Prompt Token Trend: {first_prompt:,} → {last_prompt:,} tokens")
                 output.append(f"  (+{growth:,} token growth, {growth_pct:.1f}% increase across {len(react_logs)} ReAct turns)")
                 if growth_pct > 20:
-                    output.append(f"  ⚠️ Scratchpad accumulation is significant — consider summarization strategies")
+                    output.append(f"  ⚠️ Scratchpad accumulation is significant — consider summarization strategies to reduce per-turn token cost")
 
         output.append("")
     else:
@@ -4632,8 +4659,10 @@ def analyze_conversation_performance(
             pass
         return 0
 
-    # Build timeline from execution tasks
-    react_counter = 0
+    # Build timeline entries (collect first, then sort by timestamp)
+    timeline_entries = []
+    react_logs_sorted = [log for log in gen_ai_logs if 'ReAct' in get_value(log.get('definition', ''))]
+    react_logs_sorted.sort(key=lambda x: get_value(x.get('started_at', x.get('sys_created_on', ''))))
 
     if execution_tasks:
         for i, task in enumerate(execution_tasks):
@@ -4650,6 +4679,8 @@ def analyze_conversation_performance(
                 time_only = start_time_str[:8] if start_time_str else 'N/A'
 
             # Type-specific rendering
+            display_line = ""
+
             if task_type == "Gen AI":
                 # Correlate with gen AI log for token counts
                 matched_log = find_matching_gen_ai_log(start_time_str) if start_time_str else None
@@ -4660,57 +4691,82 @@ def analyze_conversation_performance(
                 else:
                     tokens_display = ""
 
-                # Number ReAct calls
-                if 'ReAct' in description:
-                    react_counter += 1
-                    name_display = f"ReAct #{react_counter}"
-                else:
-                    name_display = description[:40]
+                # Number ReAct calls by finding position in sorted list
+                name_display = description[:40]
+                if 'ReAct' in description and matched_log:
+                    try:
+                        react_index = react_logs_sorted.index(matched_log) + 1
+                        name_display = f"ReAct #{react_index}"
+                    except:
+                        pass
 
                 duration_str = f"{duration_ms:,}ms" if duration_ms > 0 else "N/A"
                 if tokens_display:
-                    output.append(f"[{time_only}] 🧠 {name_display:40s} ({tokens_display}, {duration_str})")
+                    display_line = f"[{time_only}] 🧠 {name_display:40s} ({tokens_display}, {duration_str})"
                 else:
-                    output.append(f"[{time_only}] 🧠 {name_display:40s} ({duration_str})")
+                    display_line = f"[{time_only}] 🧠 {name_display:40s} ({duration_str})"
 
             elif task_type == "Tool":
                 name = description[:40]
                 duration_str = f"{duration_ms:,}ms" if duration_ms > 0 else "N/A"
                 status_icon = "✅" if status == 'Success' else "❌"
-                output.append(f"[{time_only}] 🔧 {name:40s} ({duration_str}) {status_icon}")
+                display_line = f"[{time_only}] 🔧 {name:40s} ({duration_str}) {status_icon}"
 
             elif task_type == "Communicator":
                 if "show response to user" in description.lower():
                     # Show message preview
                     preview = description[:60]
-                    output.append(f"[{time_only}] 💬 \"{preview}...\"")
+                    display_line = f"[{time_only}] 💬 \"{preview}...\""
                 elif "get user input" in description.lower():
-                    # Calculate user wait time
-                    next_task = execution_tasks[i + 1] if i + 1 < len(execution_tasks) else None
-                    if next_task:
-                        wait_sec = calc_user_wait(task, next_task)
-                        output.append(f"[{time_only}] 👤 User wait (~{wait_sec:.0f}s)")
-                    else:
-                        output.append(f"[{time_only}] 👤 User input requested")
+                    # Calculate user wait time - look backwards for preceding Gen AI/Communicator
+                    wait_sec = 0
+                    for j in range(i - 1, -1, -1):
+                        prev_task = execution_tasks[j]
+                        prev_type = get_value(prev_task.get('type', ''))
+                        if prev_type in ("Gen AI", "Communicator"):
+                            prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
+                            if prev_start and start_time_str:
+                                try:
+                                    from datetime import datetime
+                                    prev_dt = datetime.strptime(prev_start, "%Y-%m-%d %H:%M:%S")
+                                    curr_dt = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
+                                    wait_sec = (curr_dt - prev_dt).total_seconds()
+                                    break
+                                except:
+                                    pass
+                    display_line = f"[{time_only}] 👤 User wait — device confirmation (~{int(wait_sec)}s including agent processing)" if wait_sec > 0 else f"[{time_only}] 👤 User input requested"
                 else:
-                    output.append(f"[{time_only}] 💬 {description[:50]}")
+                    display_line = f"[{time_only}] 💬 {description[:50]}"
 
             elif task_type == "Orchestrator":
                 target = description[:50]
-                output.append(f"[{time_only}] 🔄 {target}")
+                display_line = f"[{time_only}] 🔄 {target}"
 
             elif task_type == "Agent":
                 agent_name = description[:45]
-                output.append(f"[{time_only}] 🤖 {agent_name} assigned")
+                display_line = f"[{time_only}] 🤖 {agent_name} assigned"
 
             elif task_type == "Access Verification":
-                output.append(f"[{time_only}] 🔐 Access verification — {duration_ms:,}ms" if duration_ms > 0 else f"[{time_only}] 🔐 Access verification")
+                display_line = f"[{time_only}] 🔐 Access verification — {duration_ms:,}ms" if duration_ms > 0 else f"[{time_only}] 🔐 Access verification"
 
             else:
                 # Generic task
                 icon = TYPE_ICONS.get(task_type, "📋")
-                output.append(f"[{time_only}] {icon} {description[:50]}")
+                display_line = f"[{time_only}] {icon} {description[:50]}"
 
+            if display_line:
+                timeline_entries.append({
+                    'timestamp': start_time_str,
+                    'display': display_line
+                })
+
+    # Sort timeline entries by timestamp ascending
+    timeline_entries.sort(key=lambda e: e['timestamp'])
+
+    # Render sorted timeline
+    if timeline_entries:
+        for entry in timeline_entries:
+            output.append(entry['display'])
         output.append("")
     else:
         output.append("No timeline events available.")
@@ -4844,9 +4900,33 @@ def analyze_conversation_performance(
                 time_only = time_str[:8] if time_str else 'N/A'
 
             role = get_value(msg.get('role', 'UNKNOWN'))
-            content = get_value(msg.get('content', '(no content)'))[:200]
+            user_message = get_value(msg.get('user_message', ''))
+            message = get_value(msg.get('message', ''))
+            name = get_value(msg.get('name', ''))
 
-            output.append(f"[{time_only}] {role}: {content}")
+            # Extract content based on role
+            if role == "User":
+                content = user_message or message
+            elif role == "User Profile":
+                content = message
+            else:
+                # Agent, Manager, Orchestrator — prefer user_message (user-facing text)
+                content = user_message if user_message else message
+
+            # Truncate to 300 chars
+            if len(content) > 300:
+                content = content[:300] + "... [truncated]"
+
+            # Icon selection
+            icon = "👤" if role in ["User", "User Profile"] else "🤖"
+
+            # Include name in parentheses if populated
+            if name:
+                role_display = f"{role} ({name})"
+            else:
+                role_display = role
+
+            output.append(f"[{time_only}] {icon} {role_display}: {content}")
 
         output.append("")
 
