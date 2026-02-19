@@ -3182,8 +3182,8 @@ def query_generative_ai_logs_detailed(
 ) -> str:
     """
     Query the sys_generative_ai_log table with FULL field access for detailed AI/LLM debugging.
-    This gets ALL fields including error messages, request/response data, and execution details.
-    
+    This gets ALL fields including error messages, request/response data, token counts, timing, and performance metrics.
+
     Args:
         minutes_ago: Only show logs from last N minutes (default 60)
         limit: Max number of records to return (default 20)
@@ -3199,7 +3199,8 @@ def query_generative_ai_logs_detailed(
     params = {
         "sysparm_query": f"{query}^ORDERBYDESCsys_created_on",
         "sysparm_limit": limit,
-        "sysparm_display_value": "false"  # Get raw values
+        "sysparm_display_value": "all",  # Get both raw values AND display values for references
+        "sysparm_fields": "sys_id,sys_created_on,prompt_token_count,response_token_count,time_taken,status,started_at,completed_at,prompt_config,skill_config_id,definition,domain,error,error_code,output_metadata,response,prompt,execution_plan,conversation"
     }
 
     response = requests.get(
@@ -3215,40 +3216,112 @@ def query_generative_ai_logs_detailed(
     if not results:
         return "No generative AI logs found matching your criteria."
 
+    # Helper to get display value from field that may be string or dict
+    def get_value(field):
+        if isinstance(field, dict):
+            return field.get('display_value', field.get('value', 'N/A'))
+        return field if field else 'N/A'
+
     output = []
     for log in results:
         entry = [
             f"=== GENERATIVE AI LOG ===",
-            f"Created: {log.get('sys_created_on')}",
-            f"Sys ID: {log.get('sys_id')}",
-            f"Capability: {log.get('capability', 'N/A')}",
-            f"Model: {log.get('model', 'N/A')}",
-            f"Status: {log.get('status', 'N/A')}",
-            f"Execution Plan: {log.get('execution_plan', 'N/A')}",
-            f"Provider: {log.get('provider', 'N/A')}",
-            f"Input Tokens: {log.get('input_tokens', 'N/A')}",
-            f"Output Tokens: {log.get('output_tokens', 'N/A')}",
-            f"Total Tokens: {log.get('total_tokens', 'N/A')}",
-            f"Duration (ms): {log.get('duration_ms', 'N/A')}",
+            f"Created: {get_value(log.get('sys_created_on'))}",
+            f"Sys ID: {get_value(log.get('sys_id'))}",
+            f"Status: {get_value(log.get('status'))}",
+            f"Definition: {get_value(log.get('definition'))}",
+            f"Prompt Config: {get_value(log.get('prompt_config'))}",
+            f"Skill Config: {get_value(log.get('skill_config_id'))}",
+            f"Domain: {get_value(log.get('domain'))}",
+            f"",
+            f"TIMING:",
+            f"  Started: {get_value(log.get('started_at'))}",
+            f"  Completed: {get_value(log.get('completed_at'))}",
+            f"  Time Taken: {get_value(log.get('time_taken'))} ms",
+            f"",
+            f"TOKENS:",
+            f"  Prompt Tokens: {get_value(log.get('prompt_token_count'))}",
+            f"  Response Tokens: {get_value(log.get('response_token_count'))}",
+            f"  Total: {int(get_value(log.get('prompt_token_count')) or 0) + int(get_value(log.get('response_token_count')) or 0) if get_value(log.get('prompt_token_count')) != 'N/A' and get_value(log.get('response_token_count')) != 'N/A' else 'N/A'}",
         ]
-        
+
         # Add error information if present
-        if log.get('error_message'):
-            entry.append(f"ERROR MESSAGE: {log.get('error_message')}")
-        if log.get('error_code'):
-            entry.append(f"ERROR CODE: {log.get('error_code')}")
-        if log.get('error_details'):
-            entry.append(f"ERROR DETAILS: {log.get('error_details')[:500]}")
-        
-        # Add request/response data (truncated)
-        if log.get('request'):
-            entry.append(f"\nREQUEST (first 500 chars):\n{str(log.get('request'))[:500]}")
-        if log.get('response'):
-            entry.append(f"\nRESPONSE (first 500 chars):\n{str(log.get('response'))[:500]}")
-            
+        error = get_value(log.get('error'))
+        error_code = get_value(log.get('error_code'))
+        if error != 'N/A' or error_code != 'N/A':
+            entry.extend([
+                f"",
+                f"ERROR:",
+                f"  Error Code: {error_code}",
+                f"  Error: {error}"
+            ])
+
+        # Parse output_metadata JSON if present
+        output_metadata = get_value(log.get('output_metadata'))
+        if output_metadata and output_metadata != 'N/A':
+            entry.append(f"")
+            entry.append(f"OUTPUT METADATA (first 1000 chars):")
+            entry.append(f"  {output_metadata[:1000]}")
+
+            # Try to parse JSON and extract key metrics
+            try:
+                import json
+                metadata = json.loads(output_metadata)
+
+                entry.append(f"")
+                entry.append(f"PARSED MODEL METRICS:")
+
+                # Extract model info
+                models = metadata.get('models', [])
+                if models and len(models) > 0:
+                    model = models[0]
+                    entry.append(f"  Model: {model.get('model_name', 'N/A')} ({model.get('model_version', 'N/A')})")
+                    entry.append(f"  Reasoning Effort: {model.get('reasoning_effort', 'N/A')}")
+
+                    # Extract stats
+                    stats = model.get('stats', {})
+                    if stats:
+                        entry.append(f"  Generation Time: {stats.get('generation_time_in_ms', 'N/A')} ms")
+                        entry.append(f"  Inference Time: {stats.get('inference_time_in_ms', 'N/A')} ms")
+                        entry.append(f"  Tokens/Second: {stats.get('tokens_per_second', 'N/A')}")
+                        entry.append(f"  Request Token Length: {stats.get('request_token_length', 'N/A')}")
+                        entry.append(f"  Output Token Length: {stats.get('llm_output_token_length', 'N/A')}")
+
+                    # Extract extended stats
+                    stats_ext = model.get('stats_ext', {})
+                    if stats_ext:
+                        entry.append(f"  Reasoning Tokens: {stats_ext.get('reasoning_output_token_length', 'N/A')}")
+
+                # Extract perf traces
+                perf_traces = metadata.get('perf_traces', [])
+                if perf_traces:
+                    entry.append(f"")
+                    entry.append(f"PERF TRACES:")
+                    for trace in perf_traces:
+                        stage = trace.get('name', 'Unknown')
+                        elapsed = trace.get('elapsed', 'N/A')
+                        entry.append(f"  {stage}: {elapsed} ms")
+
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                entry.append(f"  (Could not parse metadata JSON: {str(e)})")
+
+        # Add response data (truncated)
+        response_text = get_value(log.get('response'))
+        if response_text and response_text != 'N/A':
+            entry.append(f"")
+            entry.append(f"RESPONSE (first 500 chars):")
+            entry.append(f"  {response_text[:500]}")
+
+        # Add prompt data (truncated) - can be very large
+        prompt_text = get_value(log.get('prompt'))
+        if prompt_text and prompt_text != 'N/A':
+            entry.append(f"")
+            entry.append(f"PROMPT (first 500 chars):")
+            entry.append(f"  {prompt_text[:500]}")
+
         output.append("\n".join(entry))
-    
-    return "\n\n---\n\n".join(output)
+
+    return "\n\n" + ("="*80) + "\n\n".join([""] + output)
 
 
 @mcp.tool()
