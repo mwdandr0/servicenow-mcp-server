@@ -4262,19 +4262,29 @@ def analyze_conversation_performance(
         if tools_result["success"]:
             tool_executions = tools_result["data"].get("result", [])
 
-    # 2.4 Execution Tasks
+    # 2.4 Execution Tasks (with full schema)
     execution_tasks = []
     if execution_plan_id:
         tasks_result = client.table_get(
             table="sn_aia_execution_task",
             query=f"execution_plan={execution_plan_id}",
-            fields=["sys_id", "sys_created_on", "description", "order", "state", "agent"],
+            fields=["sys_id", "sys_created_on", "description", "order", "status", "start_time",
+                    "end_time", "execution_time_ms", "type", "parent", "task_dependencies"],
             limit=100,
-            order_by="order",
+            order_by="order",  # Will re-sort with multi-level logic after retrieval
             display_value="true"
         )
         if tasks_result["success"]:
             execution_tasks = tasks_result["data"].get("result", [])
+
+            # Multi-level sort: order (numeric) -> start_time -> sys_created_on
+            def sort_key(task):
+                order = parse_number(get_value(task.get("order", "0")))
+                # Prefer start_time, fall back to sys_created_on
+                time_str = get_value(task.get("start_time")) or get_value(task.get("sys_created_on"))
+                return (order, time_str)
+
+            execution_tasks.sort(key=sort_key)
 
     # 2.5 Messages
     messages = []
@@ -4440,36 +4450,69 @@ def analyze_conversation_performance(
     output.append("=" * 80)
 
     if tool_executions:
-        total_tool_time = sum(parse_number(get_value(tool.get('execution_time_ms'))) for tool in tool_executions)
+        # Build comparison table with task-level and tool-level durations
+        # Find matching tool tasks from execution_tasks
+        tool_tasks = [t for t in execution_tasks if get_value(t.get('type')) == 'Tool']
 
         output.append(f"Total Tool Calls: {len(tool_executions)}")
-        output.append(f"Total Tool Time: {total_tool_time:,} ms")
         output.append("")
 
-        # Table
-        output.append("| # | Time     | Tool                              | Duration    | Status  |")
-        output.append("|---|----------|-----------------------------------|-------------|---------|")
+        # Comparison table showing overhead
+        output.append("| Tool                              | Task Duration | Tool Duration | Delta  |")
+        output.append("|-----------------------------------|---------------|---------------|--------|")
 
-        for i, tool in enumerate(tool_executions, 1):
-            time_str = get_value(tool.get('sys_created_on', ''))
-            if ' ' in time_str:
-                time_only = time_str.split(' ')[1]
+        total_deltas = []
+
+        for tool in tool_executions:
+            tool_name = get_value(tool.get('tool', 'Unknown'))
+            tool_duration_ms = parse_number(get_value(tool.get('execution_time_ms')))
+
+            # Find matching task by correlating tool name with task description
+            matching_task = None
+            for task in tool_tasks:
+                if tool_name.lower() in get_value(task.get('description', '')).lower():
+                    matching_task = task
+                    break
+
+            if matching_task:
+                task_duration_ms = parse_number(get_value(matching_task.get('execution_time_ms')))
+                delta_ms = task_duration_ms - tool_duration_ms
+                total_deltas.append(delta_ms)
+
+                tool_name_short = tool_name[:33]
+                output.append(f"| {tool_name_short:33s} | {task_duration_ms:11,d} ms | {tool_duration_ms:11,d} ms | {delta_ms:4,d} ms |")
             else:
-                time_only = time_str[:8] if time_str else 'N/A'
-
-            tool_name = get_value(tool.get('tool', 'Unknown'))[:33]
-            duration_ms = parse_number(get_value(tool.get('execution_time_ms')))
-            status = get_value(tool.get('execution_status', 'N/A'))[:7]
-
-            output.append(f"| {i:2d} | {time_only:8s} | {tool_name:33s} | {duration_ms:9,d} ms | {status:7s} |")
+                # No matching task found, show tool duration only
+                tool_name_short = tool_name[:33]
+                output.append(f"| {tool_name_short:33s} | N/A           | {tool_duration_ms:11,d} ms | N/A    |")
 
         output.append("")
 
-        # Find slowest tool
+        # Show orchestration overhead stats
+        if total_deltas:
+            avg_overhead = sum(total_deltas) / len(total_deltas)
+            min_overhead = min(total_deltas)
+            max_overhead = max(total_deltas)
+            output.append(f"Orchestration overhead: {min_overhead:,}-{max_overhead:,}ms per tool call (avg {avg_overhead:.0f}ms)")
+            output.append("")
+
+        # Find slowest tool (use task duration if available, else tool duration)
         slowest_tool = max(tool_executions, key=lambda t: parse_number(get_value(t.get('execution_time_ms'))))
-        slowest_ms = parse_number(get_value(slowest_tool.get('execution_time_ms')))
         slowest_name = get_value(slowest_tool.get('tool'))
-        output.append(f"⚠️ SLOWEST TOOL: {slowest_name} ({slowest_ms:,} ms)")
+
+        # Try to get task duration for slowest
+        slowest_task = None
+        for task in tool_tasks:
+            if slowest_name.lower() in get_value(task.get('description', '')).lower():
+                slowest_task = task
+                break
+
+        if slowest_task:
+            slowest_ms = parse_number(get_value(slowest_task.get('execution_time_ms')))
+            output.append(f"⚠️ SLOWEST TOOL: {slowest_name} ({slowest_ms:,} ms including orchestration)")
+        else:
+            slowest_ms = parse_number(get_value(slowest_tool.get('execution_time_ms')))
+            output.append(f"⚠️ SLOWEST TOOL: {slowest_name} ({slowest_ms:,} ms)")
 
         # Check for errors
         tool_errors = [t for t in tool_executions if get_value(t.get('is_error')) == 'true' and get_value(t.get('error_message'))]
@@ -4493,21 +4536,46 @@ def analyze_conversation_performance(
     output.append("=" * 80)
 
     if execution_tasks:
+        # Type-based icons
+        TYPE_ICONS = {
+            "Gen AI": "🧠",
+            "Tool": "🔧",
+            "Communicator": "💬",
+            "Orchestrator": "🔄",
+            "Agent": "🤖",
+            "Access Verification": "🔐"
+        }
+
         output.append(f"Total Tasks: {len(execution_tasks)}")
         output.append("")
-        output.append("| Order | Task                              | Created    |")
-        output.append("|-------|-----------------------------------|------------|")
+        output.append("| Order | Type                 | Task                              | Start Time | Duration   | Status  |")
+        output.append("|-------|----------------------|-----------------------------------|------------|------------|---------|")
 
         for task in execution_tasks:
             order = get_value(task.get('order', '?'))
+            task_type = get_value(task.get('type', 'Unknown'))
             description = get_value(task.get('description', 'Unknown'))[:33]
-            created = get_value(task.get('sys_created_on', ''))
-            if ' ' in created:
-                time_only = created.split(' ')[1]
-            else:
-                time_only = created[:8] if created else 'N/A'
+            status = get_value(task.get('status', 'N/A'))[:7]
 
-            output.append(f"| {order:5s} | {description:33s} | {time_only:10s} |")
+            # Get start_time (prefer it over sys_created_on)
+            start_time_str = get_value(task.get('start_time')) or get_value(task.get('sys_created_on', ''))
+            if ' ' in start_time_str:
+                time_only = start_time_str.split(' ')[1][:8]
+            else:
+                time_only = start_time_str[:8] if start_time_str else 'N/A'
+
+            # Get duration (execution_time_ms)
+            duration_ms = parse_number(get_value(task.get('execution_time_ms')))
+            if duration_ms > 0:
+                duration_str = f"{duration_ms:,} ms"
+            else:
+                duration_str = ""
+
+            # Get type icon
+            icon = TYPE_ICONS.get(task_type, "📋")
+            type_display = f"{icon} {task_type}"[:20]
+
+            output.append(f"| {order:5s} | {type_display:20s} | {description:33s} | {time_only:10s} | {duration_str:10s} | {status:7s} |")
 
         output.append("")
     else:
@@ -4517,79 +4585,131 @@ def analyze_conversation_performance(
     # ========================================================================
     # SECTION 5: UNIFIED TIMELINE
     # ========================================================================
+    # Uses execution tasks as PRIMARY source, enriched with gen AI log token data
 
     output.append("⏱️ UNIFIED TIMELINE")
     output.append("=" * 80)
 
-    # Collect all events
-    timeline_events = []
+    # Type icons (reuse from Section 4)
+    TYPE_ICONS = {
+        "Gen AI": "🧠",
+        "Tool": "🔧",
+        "Communicator": "💬",
+        "Orchestrator": "🔄",
+        "Agent": "🤖",
+        "Access Verification": "🔐"
+    }
 
-    # Add LLM calls
-    for log in gen_ai_logs:
-        started_at = get_value(log.get('started_at', ''))
-        if started_at:
-            definition = get_value(log.get('definition', 'LLM Call'))
-            prompt_tok = parse_number(get_value(log.get('prompt_token_count')))
-            resp_tok = parse_number(get_value(log.get('response_token_count')))
-            duration_ms = parse_number(get_value(log.get('time_taken')))
+    # Helper to correlate Gen AI task with gen AI log (match within 2 seconds)
+    def find_matching_gen_ai_log(task_start_time):
+        """Find gen AI log that matches task start_time within 2 seconds."""
+        from datetime import datetime, timedelta
+        try:
+            task_dt = datetime.strptime(task_start_time, "%Y-%m-%d %H:%M:%S")
+            for log in gen_ai_logs:
+                log_start = get_value(log.get('started_at', ''))
+                if log_start:
+                    log_dt = datetime.strptime(log_start, "%Y-%m-%d %H:%M:%S")
+                    if abs((task_dt - log_dt).total_seconds()) <= 2:
+                        return log
+        except:
+            pass
+        return None
 
-            timeline_events.append({
-                'timestamp': started_at,
-                'type': 'LLM',
-                'name': definition,
-                'duration_ms': duration_ms,
-                'tokens_in': prompt_tok,
-                'tokens_out': resp_tok
-            })
+    # Helper to calculate user wait time
+    def calc_user_wait(current_task, next_task):
+        """Calculate time gap between current and next task."""
+        from datetime import datetime
+        try:
+            current_start = get_value(current_task.get('start_time')) or get_value(current_task.get('sys_created_on'))
+            next_start = get_value(next_task.get('start_time')) or get_value(next_task.get('sys_created_on'))
+            if current_start and next_start:
+                current_dt = datetime.strptime(current_start, "%Y-%m-%d %H:%M:%S")
+                next_dt = datetime.strptime(next_start, "%Y-%m-%d %H:%M:%S")
+                gap_sec = (next_dt - current_dt).total_seconds()
+                return gap_sec if gap_sec > 0 else 0
+        except:
+            pass
+        return 0
 
-    # Add tool executions
-    for tool in tool_executions:
-        created = get_value(tool.get('sys_created_on', ''))
-        if created:
-            tool_name = get_value(tool.get('tool', 'Unknown'))
-            duration_ms = parse_number(get_value(tool.get('execution_time_ms')))
-            status = get_value(tool.get('execution_status', 'Unknown'))
-
-            timeline_events.append({
-                'timestamp': created,
-                'type': 'TOOL',
-                'name': tool_name,
-                'duration_ms': duration_ms,
-                'status': status
-            })
-
-    # Sort by timestamp
-    timeline_events.sort(key=lambda e: e['timestamp'])
-
-    # Number ReAct calls
+    # Build timeline from execution tasks
     react_counter = 0
 
-    if timeline_events:
-        for event in timeline_events:
-            time_str = event['timestamp']
-            if ' ' in time_str:
-                time_only = time_str.split(' ')[1][:8]
-            else:
-                time_only = time_str[:8]
+    if execution_tasks:
+        for i, task in enumerate(execution_tasks):
+            task_type = get_value(task.get('type', ''))
+            description = get_value(task.get('description', 'Unknown'))
+            start_time_str = get_value(task.get('start_time')) or get_value(task.get('sys_created_on', ''))
+            duration_ms = parse_number(get_value(task.get('execution_time_ms')))
+            status = get_value(task.get('status', 'Unknown'))
 
-            if event['type'] == 'LLM':
+            # Format time
+            if ' ' in start_time_str:
+                time_only = start_time_str.split(' ')[1][:8]
+            else:
+                time_only = start_time_str[:8] if start_time_str else 'N/A'
+
+            # Type-specific rendering
+            if task_type == "Gen AI":
+                # Correlate with gen AI log for token counts
+                matched_log = find_matching_gen_ai_log(start_time_str) if start_time_str else None
+                if matched_log:
+                    prompt_tok = parse_number(get_value(matched_log.get('prompt_token_count')))
+                    resp_tok = parse_number(get_value(matched_log.get('response_token_count')))
+                    tokens_display = f"{prompt_tok:,}→{resp_tok:,} tokens"
+                else:
+                    tokens_display = ""
+
                 # Number ReAct calls
-                name = event['name']
-                if 'ReAct' in name:
+                if 'ReAct' in description:
                     react_counter += 1
                     name_display = f"ReAct #{react_counter}"
                 else:
-                    name_display = name[:40]
+                    name_display = description[:40]
 
-                tokens_display = f"{event['tokens_in']:,}→{event['tokens_out']:,} tokens" if event.get('tokens_in') else ""
-                duration = event['duration_ms']
-                output.append(f"[{time_only}] 🧠 LLM  | {name_display:40s} ({tokens_display}, {duration:,}ms)")
+                duration_str = f"{duration_ms:,}ms" if duration_ms > 0 else "N/A"
+                if tokens_display:
+                    output.append(f"[{time_only}] 🧠 {name_display:40s} ({tokens_display}, {duration_str})")
+                else:
+                    output.append(f"[{time_only}] 🧠 {name_display:40s} ({duration_str})")
 
-            elif event['type'] == 'TOOL':
-                name = event['name'][:40]
-                duration = event['duration_ms']
-                status_icon = "✅" if event.get('status') == 'Success' else "❌"
-                output.append(f"[{time_only}] 🔧 TOOL | {name:40s} ({duration:,}ms) {status_icon}")
+            elif task_type == "Tool":
+                name = description[:40]
+                duration_str = f"{duration_ms:,}ms" if duration_ms > 0 else "N/A"
+                status_icon = "✅" if status == 'Success' else "❌"
+                output.append(f"[{time_only}] 🔧 {name:40s} ({duration_str}) {status_icon}")
+
+            elif task_type == "Communicator":
+                if "show response to user" in description.lower():
+                    # Show message preview
+                    preview = description[:60]
+                    output.append(f"[{time_only}] 💬 \"{preview}...\"")
+                elif "get user input" in description.lower():
+                    # Calculate user wait time
+                    next_task = execution_tasks[i + 1] if i + 1 < len(execution_tasks) else None
+                    if next_task:
+                        wait_sec = calc_user_wait(task, next_task)
+                        output.append(f"[{time_only}] 👤 User wait (~{wait_sec:.0f}s)")
+                    else:
+                        output.append(f"[{time_only}] 👤 User input requested")
+                else:
+                    output.append(f"[{time_only}] 💬 {description[:50]}")
+
+            elif task_type == "Orchestrator":
+                target = description[:50]
+                output.append(f"[{time_only}] 🔄 {target}")
+
+            elif task_type == "Agent":
+                agent_name = description[:45]
+                output.append(f"[{time_only}] 🤖 {agent_name} assigned")
+
+            elif task_type == "Access Verification":
+                output.append(f"[{time_only}] 🔐 Access verification — {duration_ms:,}ms" if duration_ms > 0 else f"[{time_only}] 🔐 Access verification")
+
+            else:
+                # Generic task
+                icon = TYPE_ICONS.get(task_type, "📋")
+                output.append(f"[{time_only}] {icon} {description[:50]}")
 
         output.append("")
     else:
