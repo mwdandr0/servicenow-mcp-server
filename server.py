@@ -4718,23 +4718,52 @@ def analyze_conversation_performance(
                     preview = description[:60]
                     display_line = f"[{time_only}] 💬 \"{preview}...\""
                 elif "get user input" in description.lower():
-                    # Calculate user wait time - look backwards for preceding Gen AI/Communicator
-                    wait_sec = 0
-                    for j in range(i - 1, -1, -1):
-                        prev_task = execution_tasks[j]
-                        prev_type = get_value(prev_task.get('type', ''))
-                        if prev_type in ("Gen AI", "Communicator"):
-                            prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
-                            if prev_start and start_time_str:
-                                try:
-                                    from datetime import datetime
-                                    prev_dt = datetime.strptime(prev_start, "%Y-%m-%d %H:%M:%S")
-                                    curr_dt = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
-                                    wait_sec = (curr_dt - prev_dt).total_seconds()
-                                    break
-                                except:
-                                    pass
-                    display_line = f"[{time_only}] 👤 User wait — device confirmation (~{int(wait_sec)}s including agent processing)" if wait_sec > 0 else f"[{time_only}] 👤 User input requested"
+                    # Calculate user wait time - gap from previous task's COMPLETION to user input
+                    wait_sec = None
+                    from datetime import datetime, timedelta
+
+                    if start_time_str:
+                        try:
+                            user_input_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
+
+                            # Look backwards for nearest preceding task with execution_time_ms (Gen AI or Tool)
+                            for j in range(i - 1, -1, -1):
+                                prev_task = execution_tasks[j]
+                                prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
+                                prev_duration_str = get_value(prev_task.get('execution_time_ms'))
+
+                                if prev_start and prev_duration_str:
+                                    prev_start_time = datetime.strptime(prev_start, "%Y-%m-%d %H:%M:%S")
+                                    prev_duration_ms = parse_number(prev_duration_str)
+
+                                    if prev_duration_ms > 0:
+                                        # Calculate when previous task completed
+                                        prev_completion = prev_start_time + timedelta(milliseconds=prev_duration_ms)
+                                        gap_sec = (user_input_time - prev_completion).total_seconds()
+
+                                        if gap_sec > 0:
+                                            wait_sec = int(gap_sec)
+                                            break
+
+                            # Fallback: gap from previous task's start_time if no duration available
+                            if wait_sec is None or wait_sec <= 0:
+                                for j in range(i - 1, -1, -1):
+                                    prev_task = execution_tasks[j]
+                                    prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
+                                    if prev_start:
+                                        prev_time = datetime.strptime(prev_start, "%Y-%m-%d %H:%M:%S")
+                                        gap = (user_input_time - prev_time).total_seconds()
+                                        if gap > 0:
+                                            wait_sec = int(gap)
+                                            break
+                        except:
+                            pass
+
+                    # Format timeline entry
+                    if wait_sec and wait_sec >= 2:
+                        display_line = f"[{time_only}] 👤 User wait — user input (~{wait_sec}s)"
+                    else:
+                        display_line = f"[{time_only}] 👤 User input requested"
                 else:
                     display_line = f"[{time_only}] 💬 {description[:50]}"
 
@@ -4784,6 +4813,41 @@ def analyze_conversation_performance(
         total_llm_ms = sum(parse_number(get_value(log.get('time_taken'))) for log in gen_ai_logs)
         total_tool_ms = sum(parse_number(get_value(tool.get('execution_time_ms'))) for tool in tool_executions)
 
+        # Calculate total user wait time
+        total_user_wait_ms = 0
+        if execution_tasks:
+            from datetime import datetime, timedelta
+            for i, task in enumerate(execution_tasks):
+                description = get_value(task.get('description', ''))
+                if "get user input" in description.lower() or "user input" in description.lower():
+                    start_time_str = get_value(task.get('start_time')) or get_value(task.get('sys_created_on', ''))
+                    if start_time_str:
+                        try:
+                            user_input_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
+                            wait_ms = None
+
+                            # Look backwards for nearest preceding task with execution_time_ms
+                            for j in range(i - 1, -1, -1):
+                                prev_task = execution_tasks[j]
+                                prev_start = get_value(prev_task.get('start_time')) or get_value(prev_task.get('sys_created_on'))
+                                prev_duration_str = get_value(prev_task.get('execution_time_ms'))
+
+                                if prev_start and prev_duration_str:
+                                    prev_start_time = datetime.strptime(prev_start, "%Y-%m-%d %H:%M:%S")
+                                    prev_duration_ms = parse_number(prev_duration_str)
+
+                                    if prev_duration_ms > 0:
+                                        prev_completion = prev_start_time + timedelta(milliseconds=prev_duration_ms)
+                                        gap_ms = (user_input_time - prev_completion).total_seconds() * 1000
+                                        if gap_ms > 0:
+                                            wait_ms = gap_ms
+                                            break
+
+                            if wait_ms and wait_ms > 2000:  # Only count if > 2 seconds
+                                total_user_wait_ms += int(wait_ms)
+                        except:
+                            pass
+
         # Estimate total (this is processing time, not wall clock)
         total_processing_ms = total_llm_ms + total_tool_ms
 
@@ -4791,11 +4855,19 @@ def analyze_conversation_performance(
             llm_pct = (total_llm_ms / total_processing_ms) * 100
             tool_pct = (total_tool_ms / total_processing_ms) * 100
 
-            output.append(f"TOTAL PROCESSING TIME: {total_processing_ms:,} ms ({total_processing_ms/1000:.1f}s)")
+            output.append(f"TOTAL SYSTEM TIME: {total_processing_ms:,} ms ({total_processing_ms/1000:.1f}s)")
             output.append("")
             output.append("Time Breakdown:")
             output.append(f"  LLM Processing:  {total_llm_ms:,} ms ({llm_pct:.1f}%)")
             output.append(f"  Tool Execution:  {total_tool_ms:,} ms ({tool_pct:.1f}%)")
+
+            # Add user wait time if present (not included in percentages)
+            if total_user_wait_ms > 0:
+                output.append(f"  User Wait:       ~{total_user_wait_ms // 1000}s (not included in system time)")
+                total_wall_clock_sec = (total_processing_ms + total_user_wait_ms) // 1000
+                output.append("")
+                output.append(f"Total Wall Clock: ~{total_wall_clock_sec}s (including user wait)")
+
             output.append("")
 
         # Top 3 slowest operations
