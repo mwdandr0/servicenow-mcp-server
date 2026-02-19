@@ -182,6 +182,80 @@ Claude:
 - Ignore UI Policy mandatory fields
 - Assume field requirements (they vary by table and conditions)
 
+## AI Agent Performance Analysis Workflow
+
+When analyzing AI Agent conversation performance, follow this workflow to handle different discovery methods:
+
+### Standard AI Agents (Directly Configured)
+
+For agents configured directly in AI Agent Hub:
+
+1. Use `analyze_conversation("conversation_sys_id")` directly
+2. The tool will find the execution plan via the agent reference
+3. Analysis proceeds normally
+
+### Virtual Agent (VA) Discovered AI Agents **[SPECIAL CASE]**
+
+**Problem:** VA-discovered agents show up in execution plans with `agent` field = null or empty
+
+**How to Identify:**
+- Agent was discovered through Virtual Agent
+- Execution plan shows `agent` as null/empty
+- Normal analysis workflow fails to find execution plan
+
+**Solution - Special Lookup Workflow:**
+
+1. **Query the execution task table** to find the execution plan:
+   ```
+   snow_query(
+     table="sn_aia_execution_task",
+     query="description=Conversational Support Agent^order=200",
+     fields="execution_plan,sys_id,description,order"
+   )
+   ```
+
+2. **Get the execution plan sys_id** by dot-walking:
+   - Take the `execution_plan` field from the result
+   - This is the execution plan sys_id you need
+
+3. **Continue with normal analysis** using this execution plan sys_id
+
+### Example VA Agent Analysis
+
+```
+User: "Analyze the performance of my Conversational Support Agent"
+
+Claude:
+1. Attempts analyze_conversation(conversation_id)
+2. Notices execution plan has agent=null (VA-discovered)
+3. Queries sn_aia_execution_task:
+   - description = "Conversational Support Agent"
+   - order = 200
+4. Gets execution_plan sys_id from result
+5. Proceeds with performance analysis using this execution plan
+6. Reports findings as normal
+```
+
+### Why This Happens
+
+- **VA-discovered agents** don't have a direct agent record
+- They're discovered dynamically through Virtual Agent topics
+- Execution plans reference them differently than standard agents
+- The execution task table maintains the connection
+
+### When to Use This Workaround
+
+Use the `sn_aia_execution_task` lookup when:
+- ✅ Agent shows as null/empty in execution plan
+- ✅ Agent was discovered via Virtual Agent
+- ✅ User mentions "Conversational Support Agent" or similar VA agent
+- ✅ Normal agent lookup fails
+
+Continue with standard workflow when:
+- ❌ Agent has a proper agent reference in execution plan
+- ❌ Agent was created directly in AI Agent Hub
+- ❌ analyze_conversation works normally
+
 ## Important Notes
 
 - The MCP server authenticates as `claude.desktop` (service account)
@@ -189,3 +263,4 @@ Claude:
 - The service account needs proper permissions to order on behalf of others
 - Always confirm order details before submission
 - Report both the REQ and RITM numbers to the user
+- For VA-discovered AI Agents, use the sn_aia_execution_task lookup workaround

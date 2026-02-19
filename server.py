@@ -3947,12 +3947,94 @@ def query_agent_messages(
 # ============================================================================
 
 @mcp.tool()
+def find_va_agent_execution_plan(
+    agent_description: str = "Conversational Support Agent",
+    order: int = 200
+) -> str:
+    """
+    Find execution plan for Virtual Agent (VA) discovered AI Agents.
+
+    VA-discovered agents don't have a direct agent record and show as null/empty
+    in the execution plan. This tool finds the execution plan by querying the
+    execution task table.
+
+    Args:
+        agent_description: The description of the VA agent (default: "Conversational Support Agent")
+        order: The order number in the execution task (default: 200)
+
+    Returns:
+        Execution plan sys_id that can be used for performance analysis
+
+    Example:
+        find_va_agent_execution_plan("Conversational Support Agent", 200)
+
+    Use Case:
+        When analyze_conversation_performance fails because agent field is null,
+        use this tool to find the execution plan sys_id, then analyze that directly.
+    """
+    client = get_client()
+
+    # Query sn_aia_execution_task for VA agent
+    result = client.table_get(
+        table="sn_aia_execution_task",
+        query=f"description={agent_description}^order={order}",
+        fields=["sys_id", "execution_plan", "description", "order", "agent", "state"],
+        limit=10,
+        order_by="-sys_created_on",
+        display_value="all"
+    )
+
+    if not result["success"]:
+        return json.dumps({"error": result["error"]}, indent=2)
+
+    tasks = result["data"].get("result", [])
+
+    if not tasks:
+        return json.dumps({
+            "error": f"No VA agent found with description '{agent_description}' and order {order}",
+            "hint": "Try querying sn_aia_execution_task with different filters",
+            "searched_for": {
+                "description": agent_description,
+                "order": order
+            }
+        }, indent=2)
+
+    # Extract unique execution plans
+    execution_plans = []
+    for task in tasks:
+        ep_value = task.get("execution_plan", {})
+        # Handle both string sys_id and object with value
+        ep_sys_id = ep_value.get("value") if isinstance(ep_value, dict) else ep_value
+
+        if ep_sys_id and not any(ep["sys_id"] == ep_sys_id for ep in execution_plans):
+            execution_plans.append({
+                "sys_id": ep_sys_id,
+                "display_value": ep_value.get("display_value") if isinstance(ep_value, dict) else None,
+                "task_sys_id": task.get("sys_id"),
+                "task_state": task.get("state"),
+                "agent": task.get("agent")
+            })
+
+    return json.dumps({
+        "success": True,
+        "agent_description": agent_description,
+        "order": order,
+        "execution_plans_found": len(execution_plans),
+        "execution_plans": execution_plans,
+        "usage": "Use the execution plan sys_id with analyze_conversation_performance",
+        "example": f"analyze_conversation_performance('{execution_plans[0]['sys_id']}')" if execution_plans else None
+    }, indent=2)
+
+
+@mcp.tool()
 def analyze_conversation_performance(
     conversation_sys_id: str,
     include_raw_data: bool = False
 ) -> str:
     """
     Load ALL related data for an AI Agent conversation and analyze performance bottlenecks.
+
+    AUTO-DETECTS Virtual Agent (VA) discovered agents and handles them automatically.
 
     This tool mimics the Chrome extension behavior by loading all 13+ tables related to
     a conversation and providing comprehensive timing analysis to identify what's slow.
@@ -4192,6 +4274,53 @@ def analyze_conversation_performance(
         else:
             # Silently skip tables that error (may not exist in all instances)
             pass
+
+    # ========================================================================
+    # 1.5. AUTO-DETECT VIRTUAL AGENT (VA) DISCOVERED AGENTS
+    # ========================================================================
+
+    # Check if this is a VA-discovered agent (agent field is null/empty)
+    execution_plans = loaded_data.get("Execution Plans", [])
+    if execution_plans:
+        for ep in execution_plans:
+            agent_value = ep.get("agent")
+            # Check if agent is null, empty, or empty dict
+            is_null_agent = not agent_value or (isinstance(agent_value, dict) and not agent_value.get("value"))
+
+            if is_null_agent:
+                output.append("\n🔍 VA AGENT DETECTED")
+                output.append("=" * 80)
+                output.append("⚠️  Detected Virtual Agent (VA) discovered agent:")
+                output.append(f"   Agent field is null/empty in execution plan")
+                output.append(f"   Auto-querying sn_aia_execution_task to find execution plan...\n")
+
+                # Query execution tasks with common VA agent patterns
+                va_task_result = client.table_get(
+                    table="sn_aia_execution_task",
+                    query=f"execution_plan={conversation_sys_id}^order=200",
+                    fields=["sys_id", "description", "order", "execution_plan", "agent"],
+                    limit=5,
+                    display_value="all"
+                )
+
+                if va_task_result["success"]:
+                    va_tasks = va_task_result["data"].get("result", [])
+                    if va_tasks:
+                        output.append(f"✅ Found {len(va_tasks)} VA execution task(s):")
+                        for task in va_tasks:
+                            desc = task.get("description", "Unknown")
+                            order = task.get("order", "?")
+                            output.append(f"   • {desc} (order: {order})")
+                        output.append("\n💡 TIP: For future VA agent lookups, use:")
+                        output.append(f'   find_va_agent_execution_plan("{va_tasks[0].get("description", "Conversational Support Agent")}", {va_tasks[0].get("order", 200)})')
+                        output.append("")
+                    else:
+                        output.append("⚠️  No VA tasks found with order=200")
+                        output.append("   Try: find_va_agent_execution_plan() with different parameters")
+                        output.append("")
+                else:
+                    output.append(f"❌ Failed to query VA tasks: {va_task_result['error']}")
+                    output.append("")
 
     # ========================================================================
     # 2. CALCULATE OVERALL TIMELINE
