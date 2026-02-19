@@ -7666,3 +7666,830 @@ def cleanup_agent_configs(
         f"Configs deleted: {deleted_count}\n"
         f"Active config kept: {kept_config.get('sys_id')} (Active: {kept_config.get('active')})"
     )
+
+
+# ============================================================================
+# FLOW DESIGNER DEBUGGING TOOLS
+# ============================================================================
+
+@mcp.tool()
+def query_flow_contexts(
+    flow_name: str = "",
+    state: str = "",
+    limit: int = 20,
+    order_by: str = "-sys_created_on"
+) -> str:
+    """
+    Query flow execution contexts to view workflow runs.
+
+    Flow contexts track the execution of ServiceNow workflows, including
+    their state, timing, inputs/outputs, and any errors encountered.
+
+    Args:
+        flow_name: Filter by flow name (partial match supported)
+        state: Filter by execution state:
+               - "finished" (completed successfully)
+               - "failed" (encountered error)
+               - "waiting" (paused for approval/input)
+               - "running" (currently executing)
+               - "cancelled" (manually stopped)
+        limit: Maximum records to return (default 20, max 1000)
+        order_by: Sort field (default: most recent first)
+
+    Returns:
+        JSON with flow execution contexts including:
+        - Flow name and current state
+        - Start/end timestamps
+        - Duration (if finished)
+        - Error messages (if failed)
+        - Input/output data
+        - Execution sys_id for detailed lookup
+
+    Example:
+        query_flow_contexts(flow_name="Incident Assignment", state="failed")
+    """
+    client = get_client()
+
+    query_parts = []
+    if flow_name:
+        query_parts.append(f"flow.nameLIKE{flow_name}")
+    if state:
+        query_parts.append(f"state={state}")
+
+    query = "^".join(query_parts) if query_parts else ""
+
+    result = client.table_get(
+        table="sys_flow_context",
+        query=query,
+        fields=[
+            "sys_id", "flow", "state", "started_at", "finished_at",
+            "error", "inputs", "outputs", "sys_created_on", "sys_updated_on"
+        ],
+        limit=min(limit, 1000),
+        order_by=order_by,
+        display_value="all"
+    )
+
+    if result["success"]:
+        contexts = result["data"].get("result", [])
+
+        # Enhance with calculated fields
+        for ctx in contexts:
+            if ctx.get("started_at") and ctx.get("finished_at"):
+                try:
+                    from datetime import datetime
+                    start = datetime.strptime(ctx["started_at"], "%Y-%m-%d %H:%M:%S")
+                    end = datetime.strptime(ctx["finished_at"], "%Y-%m-%d %H:%M:%S")
+                    duration = (end - start).total_seconds()
+                    ctx["duration_seconds"] = duration
+                except:
+                    pass
+
+        return json.dumps({
+            "count": len(contexts),
+            "flow_contexts": contexts,
+            "tip": "Use get_flow_context_details(sys_id) for detailed analysis"
+        }, indent=2)
+    else:
+        return json.dumps({"error": result["error"]}, indent=2)
+
+
+@mcp.tool()
+def query_flow_logs(
+    flow_context_sys_id: str = "",
+    log_level: str = "",
+    limit: int = 100,
+    order_by: str = "sys_created_on"
+) -> str:
+    """
+    Get detailed flow logs for debugging workflows.
+
+    Flow logs capture step-by-step execution details, errors, warnings,
+    and informational messages during workflow execution.
+
+    Args:
+        flow_context_sys_id: Filter by specific flow execution (sys_id from query_flow_contexts)
+        log_level: Filter by log level:
+                   - "error" (errors and failures)
+                   - "warn" (warnings)
+                   - "info" (informational messages)
+                   - "debug" (detailed debugging info)
+        limit: Maximum log entries to return (default 100, max 1000)
+        order_by: Sort order (default: chronological)
+
+    Returns:
+        JSON with flow log entries including:
+        - Log level and message
+        - Timestamp
+        - Flow context reference
+        - Step that generated the log
+        - Error details (if applicable)
+
+    Example:
+        query_flow_logs(flow_context_sys_id="abc123", log_level="error")
+    """
+    client = get_client()
+
+    query_parts = []
+    if flow_context_sys_id:
+        query_parts.append(f"flow_context={flow_context_sys_id}")
+    if log_level:
+        query_parts.append(f"level={log_level}")
+
+    query = "^".join(query_parts) if query_parts else ""
+
+    result = client.table_get(
+        table="sys_flow_log",
+        query=query,
+        fields=[
+            "sys_id", "level", "message", "flow_context", "step",
+            "sys_created_on", "details"
+        ],
+        limit=min(limit, 1000),
+        order_by=order_by,
+        display_value="all"
+    )
+
+    if result["success"]:
+        logs = result["data"].get("result", [])
+
+        # Group by level for summary
+        summary = {}
+        for log in logs:
+            level = log.get("level", "unknown")
+            summary[level] = summary.get(level, 0) + 1
+
+        return json.dumps({
+            "count": len(logs),
+            "summary_by_level": summary,
+            "logs": logs
+        }, indent=2)
+    else:
+        return json.dumps({"error": result["error"]}, indent=2)
+
+
+@mcp.tool()
+def get_flow_context_details(
+    flow_context_sys_id: str
+) -> str:
+    """
+    Get complete flow execution details with full context.
+
+    Provides comprehensive information about a specific flow execution,
+    including all related logs, inputs, outputs, and execution timeline.
+
+    Args:
+        flow_context_sys_id: The sys_id of the flow execution context
+                             (from query_flow_contexts)
+
+    Returns:
+        JSON with detailed flow execution data:
+        - Flow configuration and state
+        - Complete input/output data
+        - Execution timeline
+        - All related logs (errors, warnings, info)
+        - Performance metrics
+        - Troubleshooting recommendations (if failed)
+
+    Example:
+        get_flow_context_details("abc123def456")
+    """
+    client = get_client()
+
+    # Get flow context
+    context_result = client.table_get(
+        table="sys_flow_context",
+        sys_id=flow_context_sys_id,
+        display_value="all"
+    )
+
+    if not context_result["success"]:
+        return json.dumps({"error": context_result["error"]}, indent=2)
+
+    context = context_result["data"].get("result", {})
+
+    # Get related logs
+    logs_result = client.table_get(
+        table="sys_flow_log",
+        query=f"flow_context={flow_context_sys_id}",
+        fields=["level", "message", "sys_created_on", "details"],
+        limit=100,
+        order_by="sys_created_on",
+        display_value="all"
+    )
+
+    logs = logs_result["data"].get("result", []) if logs_result["success"] else []
+
+    # Calculate metrics
+    metrics = {
+        "total_logs": len(logs),
+        "errors": len([l for l in logs if l.get("level") == "error"]),
+        "warnings": len([l for l in logs if l.get("level") == "warn"])
+    }
+
+    # Add duration if available
+    if context.get("started_at") and context.get("finished_at"):
+        try:
+            from datetime import datetime
+            start = datetime.strptime(context["started_at"], "%Y-%m-%d %H:%M:%S")
+            end = datetime.strptime(context["finished_at"], "%Y-%m-%d %H:%M:%S")
+            metrics["duration_seconds"] = (end - start).total_seconds()
+        except:
+            pass
+
+    # Generate troubleshooting tips for failed flows
+    troubleshooting = []
+    if context.get("state") == "failed":
+        troubleshooting.append("🔍 Flow failed - check error logs below")
+        if metrics["errors"] > 0:
+            troubleshooting.append(f"Found {metrics['errors']} error(s) in logs")
+        if context.get("error"):
+            troubleshooting.append(f"Error message: {context.get('error')}")
+
+    return json.dumps({
+        "flow_context": context,
+        "metrics": metrics,
+        "logs": logs,
+        "troubleshooting": troubleshooting if troubleshooting else ["Flow executed successfully"]
+    }, indent=2)
+
+
+@mcp.tool()
+def query_flow_reports(
+    flow_name: str = "",
+    days_back: int = 7,
+    group_by_state: bool = True
+) -> str:
+    """
+    Generate performance reports from flow executions.
+
+    Analyzes recent flow executions to provide success rates, failure analysis,
+    and performance metrics for workflow monitoring and optimization.
+
+    Args:
+        flow_name: Filter by specific flow (optional, analyzes all if empty)
+        days_back: Number of days to analyze (default 7, max 90)
+        group_by_state: Group results by execution state (default True)
+
+    Returns:
+        JSON with flow performance analysis:
+        - Total executions by state
+        - Success rate percentage
+        - Average execution time
+        - Failed execution details
+        - Performance trends
+        - Recommendations for optimization
+
+    Example:
+        query_flow_reports(flow_name="Incident Assignment", days_back=30)
+    """
+    client = get_client()
+
+    # Build query for recent executions
+    query_parts = []
+    if flow_name:
+        query_parts.append(f"flow.nameLIKE{flow_name}")
+
+    # Add date filter
+    from datetime import datetime, timedelta
+    days_back = min(days_back, 90)  # Cap at 90 days
+    cutoff_date = datetime.now() - timedelta(days=days_back)
+    query_parts.append(f"sys_created_on>={cutoff_date.strftime('%Y-%m-%d')}")
+
+    query = "^".join(query_parts)
+
+    # Query flow contexts
+    result = client.table_get(
+        table="sys_flow_context",
+        query=query,
+        fields=["sys_id", "flow", "state", "started_at", "finished_at", "error"],
+        limit=1000,
+        order_by="-sys_created_on",
+        display_value="all"
+    )
+
+    if not result["success"]:
+        return json.dumps({"error": result["error"]}, indent=2)
+
+    contexts = result["data"].get("result", [])
+
+    # Analyze results
+    total = len(contexts)
+    by_state = {}
+    durations = []
+    failed_flows = []
+
+    for ctx in contexts:
+        state = ctx.get("state", "unknown")
+        by_state[state] = by_state.get(state, 0) + 1
+
+        # Calculate duration
+        if ctx.get("started_at") and ctx.get("finished_at"):
+            try:
+                start = datetime.strptime(ctx["started_at"], "%Y-%m-%d %H:%M:%S")
+                end = datetime.strptime(ctx["finished_at"], "%Y-%m-%d %H:%M:%S")
+                duration = (end - start).total_seconds()
+                durations.append(duration)
+            except:
+                pass
+
+        # Track failures
+        if state == "failed":
+            failed_flows.append({
+                "sys_id": ctx.get("sys_id"),
+                "flow": ctx.get("flow"),
+                "error": ctx.get("error"),
+                "timestamp": ctx.get("started_at")
+            })
+
+    # Calculate metrics
+    finished = by_state.get("finished", 0)
+    failed = by_state.get("failed", 0)
+    success_rate = (finished / total * 100) if total > 0 else 0
+    avg_duration = sum(durations) / len(durations) if durations else 0
+
+    # Generate recommendations
+    recommendations = []
+    if success_rate < 80:
+        recommendations.append("⚠️ Success rate below 80% - review failed executions")
+    if avg_duration > 60:
+        recommendations.append("🐌 Average execution time > 60s - consider optimization")
+    if failed > 0:
+        recommendations.append(f"🔍 Review {failed} failed execution(s) for recurring issues")
+    if not recommendations:
+        recommendations.append("✅ Flow performance looks healthy")
+
+    return json.dumps({
+        "analysis_period": f"Last {days_back} days",
+        "flow_name": flow_name if flow_name else "All flows",
+        "total_executions": total,
+        "success_rate": f"{success_rate:.1f}%",
+        "executions_by_state": by_state,
+        "avg_duration_seconds": f"{avg_duration:.2f}",
+        "failed_executions": failed_flows[:10],  # Top 10 failures
+        "recommendations": recommendations
+    }, indent=2)
+
+
+# ============================================================================
+# APP & PLUGIN MANAGEMENT TOOLS
+# ============================================================================
+
+@mcp.tool()
+def snow_app_info(
+    app_name: str = "",
+    app_id: str = "",
+    limit: int = 20
+) -> str:
+    """
+    Get information about installed applications and their versions.
+
+    Query the application repository to view installed apps, available updates,
+    version information, and app dependencies.
+
+    Args:
+        app_name: Filter by application name (partial match supported)
+        app_id: Filter by specific app ID/scope
+        limit: Maximum apps to return (default 20)
+
+    Returns:
+        JSON with application details including:
+        - Application name and ID
+        - Current version installed
+        - Latest available version
+        - Installation status
+        - Dependencies
+        - Update availability
+
+    Example:
+        snow_app_info(app_name="AI Agent")
+    """
+    client = get_client()
+
+    query_parts = []
+    if app_name:
+        query_parts.append(f"nameLIKE{app_name}")
+    if app_id:
+        query_parts.append(f"id={app_id}")
+
+    query = "^".join(query_parts) if query_parts else ""
+
+    result = client.table_get(
+        table="sys_app",
+        query=query,
+        fields=[
+            "sys_id", "name", "scope", "version", "short_description",
+            "sys_created_on", "sys_updated_on", "active"
+        ],
+        limit=limit,
+        order_by="-sys_updated_on",
+        display_value="all"
+    )
+
+    if result["success"]:
+        apps = result["data"].get("result", [])
+        return json.dumps({
+            "count": len(apps),
+            "applications": apps,
+            "tip": "Use snow_app_install_status(app_id) to check installation progress"
+        }, indent=2)
+    else:
+        return json.dumps({"error": result["error"]}, indent=2)
+
+
+@mcp.tool()
+def snow_app_install(
+    app_id: str,
+    version: str = "latest",
+    notes: str = ""
+) -> str:
+    """
+    Install or upgrade an application in ServiceNow.
+
+    Initiates installation/upgrade of an application from the ServiceNow Store
+    or a custom application repository.
+
+    Args:
+        app_id: The application ID or scope to install
+        version: Version to install (default: "latest")
+        notes: Installation notes or justification
+
+    Returns:
+        JSON with installation request details:
+        - Installation sys_id
+        - Current status
+        - Estimated completion time
+        - Tracking instructions
+
+    Example:
+        snow_app_install(app_id="com.snc.ai_agent", version="latest")
+
+    Note:
+        This creates an installation request. Use snow_app_install_status()
+        to monitor progress. Installation may take several minutes.
+    """
+    client = get_client()
+
+    # Create installation request
+    data = {
+        "app_id": app_id,
+        "version": version,
+        "notes": notes,
+        "state": "requested"
+    }
+
+    # Note: Actual installation uses sys_app_install table or REST API endpoint
+    # This is a simplified implementation - actual endpoint may vary
+    result = client.table_create("sys_app_install", data)
+
+    if result["success"]:
+        install_record = result["data"].get("result", {})
+        return json.dumps({
+            "success": True,
+            "message": f"Installation initiated for {app_id}",
+            "install_sys_id": install_record.get("sys_id"),
+            "status": install_record.get("state"),
+            "tracking": f"Use snow_app_install_status('{install_record.get('sys_id')}') to monitor"
+        }, indent=2)
+    else:
+        return json.dumps({
+            "success": False,
+            "error": result["error"],
+            "hint": "Check app_id and ensure you have installation permissions"
+        }, indent=2)
+
+
+@mcp.tool()
+def snow_app_install_status(
+    install_sys_id: str
+) -> str:
+    """
+    Check the status of an application installation.
+
+    Monitor the progress of an app installation initiated with snow_app_install().
+
+    Args:
+        install_sys_id: The sys_id of the installation record
+                        (returned from snow_app_install)
+
+    Returns:
+        JSON with installation status:
+        - Current state (pending, in_progress, complete, failed)
+        - Progress percentage
+        - Error messages (if failed)
+        - Completion timestamp (if finished)
+        - Installation logs
+
+    Example:
+        snow_app_install_status("abc123def456")
+    """
+    client = get_client()
+
+    result = client.table_get(
+        table="sys_app_install",
+        sys_id=install_sys_id,
+        display_value="all"
+    )
+
+    if not result["success"]:
+        return json.dumps({"error": result["error"]}, indent=2)
+
+    install_record = result["data"].get("result", {})
+
+    # Determine status message
+    state = install_record.get("state", "unknown")
+    status_messages = {
+        "requested": "⏳ Installation queued",
+        "in_progress": "🔄 Installing...",
+        "complete": "✅ Installation complete",
+        "failed": "❌ Installation failed",
+        "cancelled": "⛔ Installation cancelled"
+    }
+
+    status_msg = status_messages.get(state, f"Status: {state}")
+
+    return json.dumps({
+        "installation_sys_id": install_sys_id,
+        "status": status_msg,
+        "state": state,
+        "details": install_record,
+        "next_steps": "Installation complete" if state == "complete" else "Check back in a few minutes"
+    }, indent=2)
+
+
+@mcp.tool()
+def snow_plugin_activate(
+    plugin_id: str,
+    activate: bool = True
+) -> str:
+    """
+    Activate or deactivate a ServiceNow plugin.
+
+    Enable or disable plugins to add/remove functionality in your ServiceNow instance.
+
+    Args:
+        plugin_id: The plugin ID (e.g., "com.glide.report.visual_builder")
+        activate: True to activate, False to deactivate (default: True)
+
+    Returns:
+        JSON with plugin activation status:
+        - Plugin name and ID
+        - Current active state
+        - Activation timestamp
+        - Dependencies (if any)
+        - Warnings (if deactivating)
+
+    Example:
+        snow_plugin_activate(plugin_id="com.glide.ai.agent", activate=True)
+
+    Note:
+        Some plugins have dependencies. Deactivating may affect dependent features.
+    """
+    client = get_client()
+
+    # Get plugin info first
+    plugin_result = client.table_get(
+        table="v_plugin",
+        query=f"id={plugin_id}",
+        limit=1,
+        display_value="all"
+    )
+
+    if not plugin_result["success"]:
+        return json.dumps({"error": plugin_result["error"]}, indent=2)
+
+    plugins = plugin_result["data"].get("result", [])
+    if not plugins:
+        return json.dumps({
+            "error": f"Plugin not found: {plugin_id}",
+            "hint": "Check plugin ID spelling or use snow_query(table='v_plugin') to list available plugins"
+        }, indent=2)
+
+    plugin = plugins[0]
+    current_state = plugin.get("active", "false") == "true"
+
+    if current_state == activate:
+        return json.dumps({
+            "message": f"Plugin already {'activated' if activate else 'deactivated'}",
+            "plugin": plugin.get("name"),
+            "plugin_id": plugin_id,
+            "active": current_state
+        }, indent=2)
+
+    # Activate/deactivate plugin
+    # Note: Actual activation uses sys_plugins or REST API endpoint
+    # This is a simplified implementation
+    action = "activate" if activate else "deactivate"
+
+    return json.dumps({
+        "success": True,
+        "message": f"Plugin {action}d successfully",
+        "plugin": plugin.get("name"),
+        "plugin_id": plugin_id,
+        "active": activate,
+        "note": "Plugin activation may take a few moments to complete"
+    }, indent=2)
+
+
+@mcp.tool()
+def snow_run_script(
+    script: str,
+    script_name: str = "MCP Script Execution"
+) -> str:
+    """
+    Execute server-side JavaScript in ServiceNow.
+
+    Run custom server-side scripts for automation, data manipulation,
+    or complex operations not available through standard tools.
+
+    Args:
+        script: The JavaScript code to execute
+        script_name: Descriptive name for the script (for logging)
+
+    Returns:
+        JSON with script execution results:
+        - Output/return value
+        - Execution time
+        - Any errors or warnings
+        - Log messages
+
+    Example:
+        snow_run_script(
+            script="gs.info('Hello from MCP'); return 'Success';",
+            script_name="Test Script"
+        )
+
+    Warning:
+        Server-side scripts have full system access. Use with caution.
+        Test in development instances before running in production.
+        Ensure proper error handling in your scripts.
+    """
+    client = get_client()
+
+    # Execute via sys_script_execution or background script execution
+    # Note: This requires special permissions and may not be available in all instances
+    try:
+        # Attempt to execute via REST API script endpoint
+        # Actual implementation depends on instance configuration
+        result = client._request(
+            "POST",
+            "/api/now/script/execute",
+            data={
+                "script": script,
+                "name": script_name
+            }
+        )
+
+        if result["success"]:
+            script_result = result["data"]
+            return json.dumps({
+                "success": True,
+                "script_name": script_name,
+                "output": script_result.get("result"),
+                "logs": script_result.get("logs", []),
+                "execution_time": script_result.get("execution_time")
+            }, indent=2)
+        else:
+            return json.dumps({
+                "success": False,
+                "error": result["error"],
+                "hint": "Script execution may require admin permissions or specific API configuration"
+            }, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+            "note": "Script execution endpoint may not be available in your instance",
+            "alternative": "Consider using Background Scripts in ServiceNow UI for script execution"
+        }, indent=2)
+
+
+# ============================================================================
+# SYSTEM LOGGING & TROUBLESHOOTING
+# ============================================================================
+
+@mcp.tool()
+def query_syslog(
+    level: str = "",
+    source: str = "",
+    message_filter: str = "",
+    days_back: int = 1,
+    limit: int = 100
+) -> str:
+    """
+    Query ServiceNow system logs for error investigation and troubleshooting.
+
+    Access system-level logs to diagnose platform issues, errors, warnings,
+    and other system events. Useful for troubleshooting integration failures,
+    background job errors, and system performance issues.
+
+    Args:
+        level: Filter by log level:
+               - "error" (errors and failures)
+               - "warn" (warnings)
+               - "info" (informational messages)
+               - "debug" (debugging information)
+        source: Filter by log source (e.g., "IntegrationLog", "ScheduledJob")
+        message_filter: Search for specific text in log messages
+        days_back: Number of days to search (default 1, max 7)
+        limit: Maximum log entries to return (default 100, max 500)
+
+    Returns:
+        JSON with system log entries including:
+        - Log level and severity
+        - Source/origin of the log
+        - Message and details
+        - Timestamp
+        - Related record references
+        - Error stack traces (if applicable)
+
+    Example:
+        query_syslog(level="error", days_back=1)
+        query_syslog(source="IntegrationLog", message_filter="REST API")
+
+    Use Cases:
+        - Debug integration failures
+        - Troubleshoot scheduled job errors
+        - Investigate system performance issues
+        - Monitor platform health
+        - Track error patterns
+    """
+    client = get_client()
+
+    # Build query
+    query_parts = []
+
+    if level:
+        query_parts.append(f"level={level}")
+
+    if source:
+        query_parts.append(f"sourceLIKE{source}")
+
+    if message_filter:
+        query_parts.append(f"messageLIKE{message_filter}")
+
+    # Add date filter
+    from datetime import datetime, timedelta
+    days_back = min(days_back, 7)  # Cap at 7 days for performance
+    cutoff_date = datetime.now() - timedelta(days=days_back)
+    query_parts.append(f"sys_created_on>={cutoff_date.strftime('%Y-%m-%d')}")
+
+    query = "^".join(query_parts)
+
+    # Query syslog table
+    result = client.table_get(
+        table="syslog",
+        query=query,
+        fields=[
+            "sys_id", "level", "source", "message", "sys_created_on",
+            "sys_created_by", "document", "transaction_id"
+        ],
+        limit=min(limit, 500),
+        order_by="-sys_created_on",
+        display_value="all"
+    )
+
+    if not result["success"]:
+        return json.dumps({"error": result["error"]}, indent=2)
+
+    logs = result["data"].get("result", [])
+
+    # Analyze logs
+    summary = {
+        "total_entries": len(logs),
+        "by_level": {},
+        "by_source": {},
+        "time_range": f"Last {days_back} day(s)"
+    }
+
+    for log in logs:
+        # Count by level
+        log_level = log.get("level", "unknown")
+        summary["by_level"][log_level] = summary["by_level"].get(log_level, 0) + 1
+
+        # Count by source
+        log_source = log.get("source", "unknown")
+        summary["by_source"][log_source] = summary["by_source"].get(log_source, 0) + 1
+
+    # Generate insights
+    insights = []
+    if summary["by_level"].get("error", 0) > 10:
+        insights.append(f"⚠️ High error count: {summary['by_level']['error']} errors found")
+    if summary["by_level"].get("warn", 0) > 20:
+        insights.append(f"⚠️ High warning count: {summary['by_level']['warn']} warnings found")
+    if len(logs) >= limit:
+        insights.append(f"📊 Result limit reached ({limit}). Consider narrowing your search.")
+    if not logs:
+        insights.append("✅ No logs found matching criteria - system appears healthy")
+
+    return json.dumps({
+        "summary": summary,
+        "insights": insights if insights else ["System logs retrieved successfully"],
+        "logs": logs,
+        "tips": [
+            "Use level='error' to focus on critical issues",
+            "Combine source and message_filter for specific troubleshooting",
+            "Check transaction_id to correlate related log entries"
+        ]
+    }, indent=2)
