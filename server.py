@@ -3766,27 +3766,33 @@ def query_tool_executions(
     limit: int = 20
 ) -> str:
     """
-    Query tool executions to see which tools were called and their results.
-    
+    Query tool executions to see which tools were called, their performance, and results.
+
     Args:
         execution_plan_id: Filter by specific execution plan sys_id
         tool_name: Filter by tool name
         minutes_ago: Only show executions from last N minutes (default 60)
         limit: Max number of records to return (default 20)
+
+    Returns:
+        Formatted list of tool executions with timing and status information
     """
     query_parts = []
     if execution_plan_id:
-        query_parts.append(f"execution_plan={execution_plan_id}")
+        # CRITICAL: The field is execution_plan_id, not execution_plan
+        query_parts.append(f"execution_plan_id={execution_plan_id}")
     if tool_name:
-        query_parts.append(f"tool.nameLIKE{tool_name}")
-    query_parts.append(f"sys_created_onRELATIVEGT@minute@ago@{minutes_ago}")
+        query_parts.append(f"toolLIKE{tool_name}")
+    if not execution_plan_id:  # Only add time filter if not filtering by execution plan
+        query_parts.append(f"sys_created_onRELATIVEGT@minute@ago@{minutes_ago}")
     query = "^".join(query_parts)
 
     url = f"{INSTANCE}/api/now/table/sn_aia_tools_execution"
     params = {
         "sysparm_query": f"{query}^ORDERBYDESCsys_created_on",
         "sysparm_limit": limit,
-        "sysparm_fields": "sys_id,tool.name,agent.name,state,error_message,sys_created_on,output"
+        "sysparm_display_value": "true",  # Get display values for reference fields
+        "sysparm_fields": "sys_id,sys_created_on,tool,execution_plan_id,execution_time_ms,execution_time_sec,execution_status,execution_mode,is_error,error_message,mode,status"
     }
 
     response = requests.get(
@@ -3804,17 +3810,37 @@ def query_tool_executions(
 
     output = []
     for tool_exec in results:
+        # Extract fields
+        tool = tool_exec.get('tool', 'N/A')
+        created = tool_exec.get('sys_created_on', 'N/A')
+        exec_time_ms = tool_exec.get('execution_time_ms', 'N/A')
+        exec_time_sec = tool_exec.get('execution_time_sec', 'N/A')
+        status = tool_exec.get('execution_status', 'N/A')
+        mode = tool_exec.get('execution_mode', 'N/A')
+        is_error = tool_exec.get('is_error', 'false')
         error_msg = tool_exec.get('error_message', '')
-        tool_output = tool_exec.get('output', '')
-        output.append(
-            f"Tool: {tool_exec.get('tool.name', 'N/A')}\n"
-            f"Agent: {tool_exec.get('agent.name', 'N/A')}\n"
-            f"State: {tool_exec.get('state', 'N/A')}\n"
-            f"Created: {tool_exec.get('sys_created_on', 'N/A')}"
-            + (f"\nError: {error_msg}" if error_msg else "")
-            + (f"\nOutput (first 500 chars): {tool_output[:500]}" if tool_output else "")
-        )
-    return "\n\n---\n\n".join(output)
+
+        # Format time
+        if created and len(created) > 10:
+            time_only = created.split(' ')[1] if ' ' in created else created
+        else:
+            time_only = created
+
+        # Build output
+        entry = f"[{time_only}] TOOL: {tool}\n"
+        entry += f"  Execution Time: {exec_time_ms} ms"
+        if exec_time_sec != 'N/A':
+            entry += f" ({exec_time_sec}s)"
+        entry += f"\n  Status: {status}\n"
+        entry += f"  Mode: {mode}"
+
+        # Only show error if is_error is true AND error_message is not empty
+        if is_error == 'true' and error_msg:
+            entry += f"\n  ❌ Error: {error_msg}"
+
+        output.append(entry)
+
+    return "\n\n".join(output)
 
 
 @mcp.tool()
@@ -4105,526 +4131,604 @@ def analyze_conversation_performance(
     include_raw_data: bool = False
 ) -> str:
     """
-    Load ALL related data for an AI Agent conversation and analyze performance bottlenecks.
+    Comprehensive AI Agent conversation performance analysis with accurate timing and error reporting.
 
-    AUTO-DETECTS Virtual Agent (VA) discovered agents and handles them automatically.
-
-    This tool mimics the Chrome extension behavior by loading all 13+ tables related to
-    a conversation and providing comprehensive timing analysis to identify what's slow.
+    Auto-resolves input (handles both conversation sys_id and execution_plan sys_id).
+    Correlates data across 7 tables to build complete performance picture.
 
     Args:
-        conversation_sys_id: The sys_id of sys_cs_conversation OR sn_aia_execution_plan
-        include_raw_data: If True, include full JSON of all records (very verbose)
+        conversation_sys_id: sys_id of sys_cs_conversation OR sn_aia_execution_plan
+        include_raw_data: If True, includes conversation messages at end
 
     Returns:
-        Comprehensive performance analysis including:
-        - Timeline of all events with durations
-        - Top slowest operations (LLM calls, tools, API calls)
-        - Error summary
-        - Bottleneck identification
-        - Total conversation duration
-        - Optionally: Full raw data for deep analysis
+        7-section performance analysis:
+        1. Conversation Overview
+        2. LLM Performance Summary (with output_metadata parsing)
+        3. Tool Execution Performance
+        4. Orchestration Flow
+        5. Unified Timeline (chronological merge of all events)
+        6. Bottleneck Analysis
+        7. Conversation Messages (if include_raw_data=true)
     """
+    import json
     from datetime import datetime
-
-    # Helper function to parse ServiceNow datetime
-    def parse_snow_datetime(dt_str):
-        """Parse ServiceNow datetime string to datetime object."""
-        if not dt_str:
-            return None
-        try:
-            return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-        except:
-            return None
-
-    # Helper function to calculate duration in seconds
-    def calc_duration(start_str, end_str):
-        """Calculate duration between two datetime strings in seconds."""
-        start = parse_snow_datetime(start_str)
-        end = parse_snow_datetime(end_str)
-        if start and end:
-            return (end - start).total_seconds()
-        return None
 
     client = get_client()
     output = []
-    errors = []
-    all_events = []
-
-    output.append("=" * 80)
-    output.append("COMPREHENSIVE CONVERSATION PERFORMANCE ANALYSIS")
-    output.append("=" * 80)
-    output.append(f"Conversation ID: {conversation_sys_id}\n")
 
     # ========================================================================
-    # 1. LOAD ALL CONVERSATION DATA (13+ Tables)
+    # STEP 1: INPUT PARAMETER RESOLUTION
     # ========================================================================
+    # Input can be: conversation_sys_id OR execution_plan_sys_id
+    # We need both for querying different tables
 
-    tables_to_load = [
-        {
-            "name": "Generative AI Logs",
-            "table": "sys_generative_ai_log",
-            "query": f"conversation={conversation_sys_id}",
-            "fields": ["sys_id", "definition", "started_at", "completed_at", "time_taken",
-                      "error", "error_code", "skill_config_id", "sys_created_on"],
-            "start_field": "started_at",
-            "end_field": "completed_at",
-            "duration_field": "time_taken",
-            "category": "LLM"
-        },
-        {
-            "name": "Conversation Tasks",
-            "table": "sys_cs_conversation_task",
-            "query": f"conversation={conversation_sys_id}",
-            "fields": ["sys_id", "state", "status", "conversation_type", "reason_phrase",
-                      "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "Conversation"
-        },
-        {
-            "name": "Messages",
-            "table": "sys_cs_message",
-            "query": f"conversation={conversation_sys_id}",
-            "fields": ["sys_id", "role", "content", "sys_created_on"],
-            "start_field": "sys_created_on",
-            "category": "Conversation"
-        },
-        {
-            "name": "AIA Step Logs",
-            "table": "sys_cs_aia_step_log",
-            "query": f"conversation={conversation_sys_id}",
-            "fields": ["sys_id", "step_type", "step_description", "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "AIA"
-        },
-        {
-            "name": "Execution Plans",
-            "table": "sn_aia_execution_plan",
-            "query": f"sys_id={conversation_sys_id}^ORconversation={conversation_sys_id}",
-            "fields": ["sys_id", "usecase", "agent", "state", "objective", "error_message",
-                      "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "AIA"
-        },
-        {
-            "name": "Execution Tasks",
-            "table": "sn_aia_execution_task",
-            "query": f"execution_plan={conversation_sys_id}",
-            "fields": ["sys_id", "agent", "state", "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "AIA"
-        },
-        {
-            "name": "Tool Executions",
-            "table": "sn_aia_tools_execution",
-            "query": f"execution_plan={conversation_sys_id}",
-            "fields": ["sys_id", "tool", "agent", "state", "error_message",
-                      "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "Tools"
-        },
-        {
-            "name": "AIA Messages",
-            "table": "sn_aia_message",
-            "query": f"execution_plan={conversation_sys_id}",
-            "fields": ["sys_id", "role", "content", "sys_created_on"],
-            "start_field": "sys_created_on",
-            "category": "AIA"
-        },
-        {
-            "name": "Skill Discovery",
-            "table": "sys_cs_skill_discovery_tracking",
-            "query": f"conversation={conversation_sys_id}",
-            "fields": ["sys_id", "state", "available_skill_ids", "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "Skills"
-        },
-        {
-            "name": "FDIH Invocations",
-            "table": "sys_cs_fdih_invocation",
-            "query": f"calling_cs_conversation_task.conversation.sys_id={conversation_sys_id}",
-            "fields": ["sys_id", "name", "type", "response_state", "execution_mode",
-                      "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "FDIH"
-        },
-        {
-            "name": "Now Assist Search",
-            "table": "sys_cs_now_assist_search",
-            "query": f"conversation={conversation_sys_id}",
-            "fields": ["sys_id", "query", "result_count", "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "Search"
-        },
-        {
-            "name": "API Invocations",
-            "table": "one_api_service_plan_invocation",
-            "query": f"app_document={conversation_sys_id}",
-            "fields": ["sys_id", "service_name", "capability_id", "status",
-                      "sys_created_on", "sys_updated_on"],
-            "start_field": "sys_created_on",
-            "end_field": "sys_updated_on",
-            "category": "API"
-        }
-    ]
+    actual_conversation_sys_id = None
+    execution_plan_id = None
+    execution_plan = None
 
-    loaded_data = {}
+    # Try as execution_plan first
+    ep_result = client.table_get(
+        table="sn_aia_execution_plan",
+        query=f"sys_id={conversation_sys_id}",
+        fields=["sys_id", "conversation", "objective", "state", "team", "derived_scope",
+                "start_time", "end_time", "execution_mode", "sys_created_on"],
+        limit=1,
+        display_value="false"  # Need raw conversation sys_id
+    )
 
-    for table_config in tables_to_load:
-        result = client.table_get(
-            table=table_config["table"],
-            query=table_config["query"],
-            fields=table_config["fields"],
-            limit=1000,
-            order_by="sys_created_on",
-            display_value="all"
-        )
-
-        if result["success"]:
-            records = result["data"].get("result", [])
-            loaded_data[table_config["name"]] = records
-
-            # Extract timing events
-            for record in records:
-                event = {
-                    "table": table_config["name"],
-                    "category": table_config["category"],
-                    "sys_id": record.get("sys_id"),
-                    "record": record
-                }
-
-                # Get display values (ServiceNow returns both value and display_value)
-                def get_display_value(field_data):
-                    if isinstance(field_data, dict):
-                        return field_data.get("display_value", field_data.get("value"))
-                    return field_data
-
-                # Extract start/end times
-                start_field = table_config.get("start_field")
-                end_field = table_config.get("end_field")
-
-                if start_field:
-                    event["start_time"] = get_display_value(record.get(start_field))
-                if end_field:
-                    event["end_time"] = get_display_value(record.get(end_field))
-
-                # Calculate duration
-                if "duration_field" in table_config and table_config["duration_field"]:
-                    duration_val = get_display_value(record.get(table_config["duration_field"]))
-                    try:
-                        event["duration"] = float(duration_val) if duration_val else None
-                    except (ValueError, TypeError):
-                        event["duration"] = None
-                elif start_field and end_field:
-                    event["duration"] = calc_duration(event.get("start_time"), event.get("end_time"))
-
-                # Extract name/description
-                if table_config["table"] == "sys_generative_ai_log":
-                    event["name"] = get_display_value(record.get("definition", "LLM Call"))
-                    event["error"] = record.get("error") or record.get("error_code")
-                elif table_config["table"] == "sn_aia_tools_execution":
-                    event["name"] = f"Tool: {get_display_value(record.get('tool', 'Unknown'))}"
-                    event["error"] = record.get("error_message")
-                elif table_config["table"] == "sys_cs_fdih_invocation":
-                    event["name"] = f"FDIH: {get_display_value(record.get('name', 'Unknown'))}"
-                elif table_config["table"] == "one_api_service_plan_invocation":
-                    event["name"] = f"API: {get_display_value(record.get('service_name', 'Unknown'))}"
-                else:
-                    event["name"] = table_config["name"]
-
-                if event.get("error"):
-                    errors.append(event)
-
-                all_events.append(event)
-        else:
-            # Silently skip tables that error (may not exist in all instances)
-            pass
-
-    # ========================================================================
-    # 1.5. AUTO-DETECT VIRTUAL AGENT (VA) DISCOVERED AGENTS
-    # ========================================================================
-
-    # Check if this is a VA-discovered agent (agent field is null/empty)
-    execution_plans = loaded_data.get("Execution Plans", [])
-    if execution_plans:
-        for ep in execution_plans:
-            agent_value = ep.get("agent")
-            # Check if agent is null, empty, or empty dict
-            is_null_agent = not agent_value or (isinstance(agent_value, dict) and not agent_value.get("value"))
-
-            if is_null_agent:
-                output.append("\n🔍 VA AGENT DETECTED")
-                output.append("=" * 80)
-                output.append("⚠️  Detected Virtual Agent (VA) discovered agent:")
-                output.append(f"   Agent field is null/empty in execution plan")
-                output.append(f"   Auto-querying sn_aia_execution_task to find execution plan...\n")
-
-                # Query execution tasks with common VA agent patterns
-                va_task_result = client.table_get(
-                    table="sn_aia_execution_task",
-                    query=f"execution_plan={conversation_sys_id}^order=200",
-                    fields=["sys_id", "description", "order", "execution_plan", "agent"],
-                    limit=5,
-                    display_value="all"
-                )
-
-                if va_task_result["success"]:
-                    va_tasks = va_task_result["data"].get("result", [])
-                    if va_tasks:
-                        output.append(f"✅ Found {len(va_tasks)} VA execution task(s):")
-                        for task in va_tasks:
-                            desc = task.get("description", "Unknown")
-                            order = task.get("order", "?")
-                            output.append(f"   • {desc} (order: {order})")
-                        output.append("\n💡 TIP: For future VA agent lookups, use:")
-                        output.append(f'   find_va_agent_execution_plan("{va_tasks[0].get("description", "Conversational Support Agent")}", {va_tasks[0].get("order", 200)})')
-                        output.append("")
-                    else:
-                        output.append("⚠️  No VA tasks found with order=200")
-                        output.append("   Try: find_va_agent_execution_plan() with different parameters")
-                        output.append("")
-                else:
-                    output.append(f"❌ Failed to query VA tasks: {va_task_result['error']}")
-                    output.append("")
-
-    # ========================================================================
-    # 2. CALCULATE OVERALL TIMELINE
-    # ========================================================================
-
-    if all_events:
-        # Sort events by start time
-        events_with_times = [e for e in all_events if e.get("start_time")]
-        if events_with_times:
-            events_with_times.sort(key=lambda e: e.get("start_time", ""))
-
-            first_event_time = events_with_times[0].get("start_time")
-            last_event_time = max(
-                (e.get("end_time") or e.get("start_time") for e in events_with_times),
-                default=first_event_time
-            )
-
-            total_duration = calc_duration(first_event_time, last_event_time)
-
-            output.append(f"📊 OVERALL TIMELINE")
-            output.append(f"   First Event:  {first_event_time}")
-            output.append(f"   Last Event:   {last_event_time}")
-            if total_duration:
-                output.append(f"   Total Duration: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
-            output.append("")
-
-    # ========================================================================
-    # 3. RECORD COUNTS BY TABLE
-    # ========================================================================
-
-    output.append(f"📋 RECORDS LOADED BY TABLE")
-    for table_name, records in loaded_data.items():
-        output.append(f"   {table_name}: {len(records)} records")
-    output.append("")
-
-    # ========================================================================
-    # 4. TOP SLOWEST OPERATIONS
-    # ========================================================================
-
-    output.append(f"🐌 TOP 10 SLOWEST OPERATIONS")
-    output.append(f"{'-' * 80}")
-
-    # Filter events with duration and sort by slowest
-    events_with_duration = [e for e in all_events if e.get("duration") is not None and e.get("duration") > 0]
-    events_with_duration.sort(key=lambda e: e["duration"], reverse=True)
-
-    if events_with_duration:
-        for i, event in enumerate(events_with_duration[:10], 1):
-            duration = event["duration"]
-            output.append(
-                f"{i:2d}. [{event['category']:12s}] {event['name'][:50]:50s} | "
-                f"{duration:7.2f}s | {event.get('start_time', 'N/A')}"
-            )
-            if event.get("error"):
-                output.append(f"     ⚠️  ERROR: {str(event['error'])[:100]}")
+    if ep_result["success"] and ep_result["data"].get("result"):
+        # Input was execution_plan_id
+        execution_plan = ep_result["data"]["result"][0]
+        execution_plan_id = execution_plan.get("sys_id")
+        actual_conversation_sys_id = execution_plan.get("conversation")
     else:
-        output.append("   No operations with duration data found.")
-    output.append("")
-
-    # ========================================================================
-    # 5. BREAKDOWN BY CATEGORY
-    # ========================================================================
-
-    output.append(f"📊 PERFORMANCE BY CATEGORY")
-    output.append(f"{'-' * 80}")
-
-    categories = {}
-    for event in events_with_duration:
-        cat = event["category"]
-        if cat not in categories:
-            categories[cat] = {"count": 0, "total_duration": 0, "events": []}
-        categories[cat]["count"] += 1
-        categories[cat]["total_duration"] += event["duration"]
-        categories[cat]["events"].append(event)
-
-    # Sort by total duration
-    sorted_categories = sorted(categories.items(), key=lambda x: x[1]["total_duration"], reverse=True)
-
-    for cat_name, cat_data in sorted_categories:
-        avg_duration = cat_data["total_duration"] / cat_data["count"]
-        output.append(
-            f"{cat_name:12s} | Count: {cat_data['count']:3d} | "
-            f"Total: {cat_data['total_duration']:7.2f}s | Avg: {avg_duration:6.2f}s"
+        # Input is conversation_sys_id, reverse-lookup execution_plan
+        actual_conversation_sys_id = conversation_sys_id
+        ep_result = client.table_get(
+            table="sn_aia_execution_plan",
+            query=f"conversation={conversation_sys_id}",
+            fields=["sys_id", "conversation", "objective", "state", "team", "derived_scope",
+                    "start_time", "end_time", "execution_mode", "sys_created_on"],
+            limit=1,
+            display_value="false"
         )
+        if ep_result["success"] and ep_result["data"].get("result"):
+            execution_plan = ep_result["data"]["result"][0]
+            execution_plan_id = execution_plan.get("sys_id")
 
-        # Show top 3 slowest in this category
-        slowest_in_cat = sorted(cat_data["events"], key=lambda e: e["duration"], reverse=True)[:3]
-        for event in slowest_in_cat:
-            output.append(f"   → {event['name'][:60]:60s} {event['duration']:6.2f}s")
+    if not actual_conversation_sys_id:
+        return "Error: Could not resolve conversation_sys_id from input. Please provide valid conversation or execution_plan sys_id."
+
+    # ========================================================================
+    # STEP 2: DATA COLLECTION (7 Tables)
+    # ========================================================================
+
+    # Helper to strip commas from numeric strings
+    def parse_number(val):
+        """Parse ServiceNow formatted numbers like '46,442' -> 46442"""
+        if not val:
+            return 0
+        try:
+            return int(str(val).replace(",", ""))
+        except (ValueError, TypeError):
+            return 0
+
+    # Helper to get display value from field
+    def get_value(field):
+        if isinstance(field, dict):
+            return field.get('display_value', field.get('value', ''))
+        return field if field else ''
+
+    # 2.1 Conversation metadata
+    conversation = {}
+    conv_result = client.table_get(
+        table="sys_cs_conversation",
+        query=f"sys_id={actual_conversation_sys_id}",
+        fields=["sys_id", "sys_created_on", "state", "topic", "channel", "opened_at", "closed_at"],
+        limit=1,
+        display_value="true"
+    )
+    if conv_result["success"] and conv_result["data"].get("result"):
+        conversation = conv_result["data"]["result"][0]
+
+    # 2.2 Gen AI Logs (LLM calls)
+    gen_ai_logs = []
+    if actual_conversation_sys_id:
+        logs_result = client.table_get(
+            table="sys_generative_ai_log",
+            query=f"metadata_document={actual_conversation_sys_id}",
+            fields=["sys_id", "sys_created_on", "definition", "prompt_token_count",
+                    "response_token_count", "time_taken", "status", "started_at", "completed_at",
+                    "skill_config_id", "domain", "error", "error_code", "output_metadata"],
+            limit=100,
+            order_by="sys_created_on",
+            display_value="true"
+        )
+        if logs_result["success"]:
+            gen_ai_logs = logs_result["data"].get("result", [])
+
+    # 2.3 Tool Executions
+    tool_executions = []
+    if execution_plan_id:
+        tools_result = client.table_get(
+            table="sn_aia_tools_execution",
+            query=f"execution_plan_id={execution_plan_id}",  # CRITICAL: execution_plan_id not execution_plan
+            fields=["sys_id", "sys_created_on", "tool", "execution_time_ms", "execution_time_sec",
+                    "execution_status", "execution_mode", "is_error", "error_message"],
+            limit=100,
+            order_by="sys_created_on",
+            display_value="true"
+        )
+        if tools_result["success"]:
+            tool_executions = tools_result["data"].get("result", [])
+
+    # 2.4 Execution Tasks
+    execution_tasks = []
+    if execution_plan_id:
+        tasks_result = client.table_get(
+            table="sn_aia_execution_task",
+            query=f"execution_plan={execution_plan_id}",
+            fields=["sys_id", "sys_created_on", "description", "order", "state", "agent"],
+            limit=100,
+            order_by="order",
+            display_value="true"
+        )
+        if tasks_result["success"]:
+            execution_tasks = tasks_result["data"].get("result", [])
+
+    # 2.5 Messages
+    messages = []
+    if execution_plan_id:
+        msg_result = client.table_get(
+            table="sn_aia_message",
+            query=f"execution_plan={execution_plan_id}",
+            fields=["sys_id", "sys_created_on", "role", "content"],
+            limit=50,
+            order_by="sys_created_on",
+            display_value="true"
+        )
+        if msg_result["success"]:
+            messages = msg_result["data"].get("result", [])
+
+    # 2.6 Conversation Tasks (VA routing)
+    conv_tasks = []
+    if actual_conversation_sys_id:
+        ct_result = client.table_get(
+            table="sys_cs_conversation_task",
+            query=f"conversation={actual_conversation_sys_id}",
+            fields=["sys_id", "sys_created_on", "name", "state"],
+            limit=100,
+            order_by="sys_created_on",
+            display_value="true"
+        )
+        if ct_result["success"]:
+            conv_tasks = ct_result["data"].get("result", [])
+
+    # ========================================================================
+    # SECTION 1: CONVERSATION OVERVIEW
+    # ========================================================================
+
+    output.append("=" * 80)
+    output.append("CONVERSATION PERFORMANCE ANALYSIS")
+    output.append("=" * 80)
+    output.append(f"Conversation: {actual_conversation_sys_id}")
+    output.append(f"Execution Plan: {execution_plan_id or 'N/A'}")
+
+    if execution_plan:
+        output.append(f"Objective: {get_value(execution_plan.get('objective', 'N/A'))}")
+        output.append(f"State: {get_value(execution_plan.get('state', 'N/A'))}")
+        output.append(f"Scope: {get_value(execution_plan.get('derived_scope', 'N/A'))}")
+        output.append(f"Team: {get_value(execution_plan.get('team', 'N/A'))}")
+
+    output.append("")
+    output.append("Timeline:")
+    output.append(f"  Conversation Created: {get_value(conversation.get('sys_created_on', 'N/A'))}")
+
+    if gen_ai_logs:
+        first_llm = min((get_value(log.get('started_at', '')) for log in gen_ai_logs if get_value(log.get('started_at'))), default='N/A')
+        last_llm = max((get_value(log.get('completed_at', '')) for log in gen_ai_logs if get_value(log.get('completed_at'))), default='N/A')
+        output.append(f"  First LLM Call: {first_llm}")
+        output.append(f"  Last LLM Call: {last_llm}")
+
+        # Calculate wall clock duration
+        if first_llm != 'N/A' and last_llm != 'N/A':
+            try:
+                first_dt = datetime.strptime(first_llm, "%Y-%m-%d %H:%M:%S")
+                last_dt = datetime.strptime(last_llm, "%Y-%m-%d %H:%M:%S")
+                wall_clock_sec = (last_dt - first_dt).total_seconds()
+                output.append(f"  Wall Clock Duration: {wall_clock_sec:.1f} seconds")
+            except:
+                pass
+
     output.append("")
 
     # ========================================================================
-    # 6. ERROR SUMMARY
+    # SECTION 2: LLM PERFORMANCE SUMMARY
     # ========================================================================
 
-    if errors:
-        output.append(f"❌ ERRORS DETECTED ({len(errors)} total)")
-        output.append(f"{'-' * 80}")
-        for i, error_event in enumerate(errors[:10], 1):
-            output.append(f"{i}. [{error_event['category']}] {error_event['name']}")
-            output.append(f"   Time: {error_event.get('start_time', 'N/A')}")
-            output.append(f"   Error: {str(error_event.get('error'))[:200]}")
-            output.append("")
+    output.append("📊 LLM CALL SUMMARY")
+    output.append("=" * 80)
 
-    # ========================================================================
-    # 7. BOTTLENECK IDENTIFICATION
-    # ========================================================================
+    if gen_ai_logs:
+        total_prompt_tokens = sum(parse_number(get_value(log.get('prompt_token_count'))) for log in gen_ai_logs)
+        total_response_tokens = sum(parse_number(get_value(log.get('response_token_count'))) for log in gen_ai_logs)
+        total_llm_time = sum(parse_number(get_value(log.get('time_taken'))) for log in gen_ai_logs)
 
-    output.append(f"🎯 BOTTLENECK ANALYSIS")
-    output.append(f"{'-' * 80}")
-
-    if events_with_duration:
-        # Find longest operation
-        slowest = events_with_duration[0]
-        output.append(f"⚠️  SLOWEST OPERATION:")
-        output.append(f"   {slowest['name']}")
-        output.append(f"   Duration: {slowest['duration']:.2f} seconds")
-        output.append(f"   Category: {slowest['category']}")
-        output.append(f"   Time: {slowest.get('start_time', 'N/A')}")
+        output.append(f"Total LLM Calls: {len(gen_ai_logs)}")
+        output.append(f"Total Prompt Tokens: {total_prompt_tokens:,}")
+        output.append(f"Total Response Tokens: {total_response_tokens:,}")
+        output.append(f"Total LLM Time: {total_llm_time:,} ms")
         output.append("")
 
-        # Find category taking most time
-        if sorted_categories:
-            slowest_cat = sorted_categories[0]
-            output.append(f"⚠️  SLOWEST CATEGORY: {slowest_cat[0]}")
-            output.append(f"   Total time: {slowest_cat[1]['total_duration']:.2f} seconds")
-            output.append(f"   Operations: {slowest_cat[1]['count']}")
-            output.append("")
+        # Table header
+        output.append("| # | Time     | Definition                        | Prompt Tok | Resp Tok | Duration |")
+        output.append("|---|----------|-----------------------------------|-----------|----------|----------|")
 
-        # Identify time gaps (periods of inactivity)
-        output.append(f"🕐 TIME GAPS (potential waiting/idle periods):")
-        events_sorted = sorted(events_with_times, key=lambda e: e.get("start_time", ""))
+        for i, log in enumerate(gen_ai_logs, 1):
+            time_str = get_value(log.get('started_at', ''))
+            if ' ' in time_str:
+                time_only = time_str.split(' ')[1]
+            else:
+                time_only = time_str[:8] if time_str else 'N/A'
 
-        gaps = []
-        for i in range(len(events_sorted) - 1):
-            current_end = events_sorted[i].get("end_time") or events_sorted[i].get("start_time")
-            next_start = events_sorted[i + 1].get("start_time")
+            definition = get_value(log.get('definition', 'LLM Call'))[:33]
+            prompt_tok = parse_number(get_value(log.get('prompt_token_count')))
+            resp_tok = parse_number(get_value(log.get('response_token_count')))
+            duration = parse_number(get_value(log.get('time_taken')))
 
-            if current_end and next_start:
-                gap_duration = calc_duration(current_end, next_start)
-                if gap_duration and gap_duration > 0.5:  # Only show gaps > 0.5 seconds
-                    gaps.append({
-                        "duration": gap_duration,
-                        "after": events_sorted[i]["name"],
-                        "before": events_sorted[i + 1]["name"],
-                        "time": current_end
-                    })
+            output.append(f"| {i:2d} | {time_only:8s} | {definition:33s} | {prompt_tok:9,d} | {resp_tok:8,d} | {duration:6,d} ms |")
 
-        gaps.sort(key=lambda g: g["duration"], reverse=True)
+        output.append("")
 
-        if gaps:
-            for i, gap in enumerate(gaps[:5], 1):
-                output.append(
-                    f"   {i}. Gap of {gap['duration']:.2f}s at {gap['time']}"
-                )
-                output.append(f"      After:  {gap['after'][:60]}")
-                output.append(f"      Before: {gap['before'][:60]}")
-        else:
-            output.append("   No significant time gaps detected (all < 0.5s)")
+        # Parse output_metadata for model info (from first record that has it)
+        model_name = None
+        model_version = None
+        tokens_per_sec_list = []
+
+        for log in gen_ai_logs:
+            metadata_str = get_value(log.get('output_metadata', ''))
+            if metadata_str and metadata_str not in ['N/A', '']:
+                try:
+                    metadata = json.loads(metadata_str)
+                    models = metadata.get('models', [])
+                    if models and isinstance(models, list) and len(models) > 0:
+                        model = models[0]
+                        if not model_name:
+                            model_name = model.get('model_name')
+                            model_version = model.get('model_version')
+
+                        stats = model.get('stats', {})
+                        tps = stats.get('tokens_per_second')
+                        if tps:
+                            try:
+                                tokens_per_sec_list.append(float(tps))
+                            except:
+                                pass
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+
+        if model_name:
+            output.append(f"Model: {model_name} ({model_version or 'unknown version'})")
+        if tokens_per_sec_list:
+            avg_tps = sum(tokens_per_sec_list) / len(tokens_per_sec_list)
+            output.append(f"Avg Tokens/Second: {avg_tps:.1f}")
+
+        # Prompt token growth analysis (ReAct Engine)
+        react_logs = [log for log in gen_ai_logs if 'ReAct' in get_value(log.get('definition', ''))]
+        if len(react_logs) >= 2:
+            first_prompt = parse_number(get_value(react_logs[0].get('prompt_token_count')))
+            last_prompt = parse_number(get_value(react_logs[-1].get('prompt_token_count')))
+            if first_prompt > 0:
+                growth = last_prompt - first_prompt
+                growth_pct = (growth / first_prompt) * 100
+                output.append("")
+                output.append(f"Prompt Token Trend: {first_prompt:,} → {last_prompt:,} tokens")
+                output.append(f"  (+{growth:,} token growth, {growth_pct:.1f}% increase across {len(react_logs)} ReAct turns)")
+                if growth_pct > 20:
+                    output.append(f"  ⚠️ Scratchpad accumulation is significant — consider summarization strategies")
+
+        output.append("")
     else:
-        output.append("   Insufficient timing data for bottleneck analysis.")
-
-    output.append("")
+        output.append("No LLM calls found.")
+        output.append("")
 
     # ========================================================================
-    # 8. RECOMMENDATIONS
+    # SECTION 3: TOOL EXECUTION PERFORMANCE
     # ========================================================================
 
-    output.append(f"💡 RECOMMENDATIONS")
-    output.append(f"{'-' * 80}")
+    output.append("🔧 TOOL EXECUTIONS")
+    output.append("=" * 80)
 
-    if events_with_duration:
-        # Recommend based on slowest category
-        if sorted_categories:
-            slowest_cat_name = sorted_categories[0][0]
-            slowest_cat_data = sorted_categories[0][1]
+    if tool_executions:
+        total_tool_time = sum(parse_number(get_value(tool.get('execution_time_ms'))) for tool in tool_executions)
 
-            if slowest_cat_name == "LLM" and slowest_cat_data["total_duration"] > 10:
-                output.append("   ⚡ LLM calls are taking significant time:")
-                output.append("      • Consider reducing prompt sizes")
-                output.append("      • Use faster models for simple tasks")
-                output.append("      • Implement prompt caching where possible")
-                output.append("")
+        output.append(f"Total Tool Calls: {len(tool_executions)}")
+        output.append(f"Total Tool Time: {total_tool_time:,} ms")
+        output.append("")
 
-            if slowest_cat_name == "Tools" and slowest_cat_data["total_duration"] > 5:
-                output.append("   ⚡ Tool executions are slow:")
-                output.append("      • Review tool implementation performance")
-                output.append("      • Consider caching tool results")
-                output.append("      • Check for unnecessary API calls in tools")
-                output.append("")
+        # Table
+        output.append("| # | Time     | Tool                              | Duration    | Status  |")
+        output.append("|---|----------|-----------------------------------|-------------|---------|")
 
-            if slowest_cat_name == "API" and slowest_cat_data["total_duration"] > 5:
-                output.append("   ⚡ API calls are taking significant time:")
-                output.append("      • Consider batch API calls where possible")
-                output.append("      • Review API endpoint performance")
-                output.append("      • Check network latency")
-                output.append("")
+        for i, tool in enumerate(tool_executions, 1):
+            time_str = get_value(tool.get('sys_created_on', ''))
+            if ' ' in time_str:
+                time_only = time_str.split(' ')[1]
+            else:
+                time_only = time_str[:8] if time_str else 'N/A'
 
-        if gaps and gaps[0]["duration"] > 2:
-            output.append("   ⚡ Large time gaps detected:")
-            output.append("      • Investigate what's happening during idle periods")
-            output.append("      • Check for synchronous operations that could be parallelized")
-            output.append("      • Review skill discovery and routing logic")
+            tool_name = get_value(tool.get('tool', 'Unknown'))[:33]
+            duration_ms = parse_number(get_value(tool.get('execution_time_ms')))
+            status = get_value(tool.get('execution_status', 'N/A'))[:7]
+
+            output.append(f"| {i:2d} | {time_only:8s} | {tool_name:33s} | {duration_ms:9,d} ms | {status:7s} |")
+
+        output.append("")
+
+        # Find slowest tool
+        slowest_tool = max(tool_executions, key=lambda t: parse_number(get_value(t.get('execution_time_ms'))))
+        slowest_ms = parse_number(get_value(slowest_tool.get('execution_time_ms')))
+        slowest_name = get_value(slowest_tool.get('tool'))
+        output.append(f"⚠️ SLOWEST TOOL: {slowest_name} ({slowest_ms:,} ms)")
+
+        # Check for errors
+        tool_errors = [t for t in tool_executions if get_value(t.get('is_error')) == 'true' and get_value(t.get('error_message'))]
+        if tool_errors:
+            output.append("")
+            for err_tool in tool_errors:
+                tool_name = get_value(err_tool.get('tool'))
+                err_msg = get_value(err_tool.get('error_message'))
+                output.append(f"❌ TOOL ERROR: {tool_name} — {err_msg}")
+
+        output.append("")
+    else:
+        output.append("No tool executions found.")
+        output.append("")
+
+    # ========================================================================
+    # SECTION 4: ORCHESTRATION FLOW
+    # ========================================================================
+
+    output.append("🔄 EXECUTION TASK CHAIN")
+    output.append("=" * 80)
+
+    if execution_tasks:
+        output.append(f"Total Tasks: {len(execution_tasks)}")
+        output.append("")
+        output.append("| Order | Task                              | Created    |")
+        output.append("|-------|-----------------------------------|------------|")
+
+        for task in execution_tasks:
+            order = get_value(task.get('order', '?'))
+            description = get_value(task.get('description', 'Unknown'))[:33]
+            created = get_value(task.get('sys_created_on', ''))
+            if ' ' in created:
+                time_only = created.split(' ')[1]
+            else:
+                time_only = created[:8] if created else 'N/A'
+
+            output.append(f"| {order:5s} | {description:33s} | {time_only:10s} |")
+
+        output.append("")
+    else:
+        output.append("No execution tasks found.")
+        output.append("")
+
+    # ========================================================================
+    # SECTION 5: UNIFIED TIMELINE
+    # ========================================================================
+
+    output.append("⏱️ UNIFIED TIMELINE")
+    output.append("=" * 80)
+
+    # Collect all events
+    timeline_events = []
+
+    # Add LLM calls
+    for log in gen_ai_logs:
+        started_at = get_value(log.get('started_at', ''))
+        if started_at:
+            definition = get_value(log.get('definition', 'LLM Call'))
+            prompt_tok = parse_number(get_value(log.get('prompt_token_count')))
+            resp_tok = parse_number(get_value(log.get('response_token_count')))
+            duration_ms = parse_number(get_value(log.get('time_taken')))
+
+            timeline_events.append({
+                'timestamp': started_at,
+                'type': 'LLM',
+                'name': definition,
+                'duration_ms': duration_ms,
+                'tokens_in': prompt_tok,
+                'tokens_out': resp_tok
+            })
+
+    # Add tool executions
+    for tool in tool_executions:
+        created = get_value(tool.get('sys_created_on', ''))
+        if created:
+            tool_name = get_value(tool.get('tool', 'Unknown'))
+            duration_ms = parse_number(get_value(tool.get('execution_time_ms')))
+            status = get_value(tool.get('execution_status', 'Unknown'))
+
+            timeline_events.append({
+                'timestamp': created,
+                'type': 'TOOL',
+                'name': tool_name,
+                'duration_ms': duration_ms,
+                'status': status
+            })
+
+    # Sort by timestamp
+    timeline_events.sort(key=lambda e: e['timestamp'])
+
+    # Number ReAct calls
+    react_counter = 0
+
+    if timeline_events:
+        for event in timeline_events:
+            time_str = event['timestamp']
+            if ' ' in time_str:
+                time_only = time_str.split(' ')[1][:8]
+            else:
+                time_only = time_str[:8]
+
+            if event['type'] == 'LLM':
+                # Number ReAct calls
+                name = event['name']
+                if 'ReAct' in name:
+                    react_counter += 1
+                    name_display = f"ReAct #{react_counter}"
+                else:
+                    name_display = name[:40]
+
+                tokens_display = f"{event['tokens_in']:,}→{event['tokens_out']:,} tokens" if event.get('tokens_in') else ""
+                duration = event['duration_ms']
+                output.append(f"[{time_only}] 🧠 LLM  | {name_display:40s} ({tokens_display}, {duration:,}ms)")
+
+            elif event['type'] == 'TOOL':
+                name = event['name'][:40]
+                duration = event['duration_ms']
+                status_icon = "✅" if event.get('status') == 'Success' else "❌"
+                output.append(f"[{time_only}] 🔧 TOOL | {name:40s} ({duration:,}ms) {status_icon}")
+
+        output.append("")
+    else:
+        output.append("No timeline events available.")
+        output.append("")
+
+    # ========================================================================
+    # SECTION 6: BOTTLENECK ANALYSIS
+    # ========================================================================
+
+    output.append("🎯 BOTTLENECK ANALYSIS")
+    output.append("=" * 80)
+
+    if gen_ai_logs or tool_executions:
+        # Calculate totals
+        total_llm_ms = sum(parse_number(get_value(log.get('time_taken'))) for log in gen_ai_logs)
+        total_tool_ms = sum(parse_number(get_value(tool.get('execution_time_ms'))) for tool in tool_executions)
+
+        # Estimate total (this is processing time, not wall clock)
+        total_processing_ms = total_llm_ms + total_tool_ms
+
+        if total_processing_ms > 0:
+            llm_pct = (total_llm_ms / total_processing_ms) * 100
+            tool_pct = (total_tool_ms / total_processing_ms) * 100
+
+            output.append(f"TOTAL PROCESSING TIME: {total_processing_ms:,} ms ({total_processing_ms/1000:.1f}s)")
+            output.append("")
+            output.append("Time Breakdown:")
+            output.append(f"  LLM Processing:  {total_llm_ms:,} ms ({llm_pct:.1f}%)")
+            output.append(f"  Tool Execution:  {total_tool_ms:,} ms ({tool_pct:.1f}%)")
             output.append("")
 
-        if errors:
-            output.append("   ⚡ Errors detected:")
-            output.append("      • Fix errors to improve overall performance")
-            output.append("      • Errors may cause retries and additional delays")
+        # Top 3 slowest operations
+        all_operations = []
+        for log in gen_ai_logs:
+            all_operations.append({
+                'type': 'LLM',
+                'name': get_value(log.get('definition', 'LLM Call')),
+                'duration_ms': parse_number(get_value(log.get('time_taken')))
+            })
+        for tool in tool_executions:
+            all_operations.append({
+                'type': 'TOOL',
+                'name': get_value(tool.get('tool', 'Unknown')),
+                'duration_ms': parse_number(get_value(tool.get('execution_time_ms')))
+            })
+
+        all_operations.sort(key=lambda op: op['duration_ms'], reverse=True)
+
+        if all_operations:
+            output.append("Top 3 Slowest Operations:")
+            for i, op in enumerate(all_operations[:3], 1):
+                icon = "🔧" if op['type'] == 'TOOL' else "🧠"
+                output.append(f"  {i}. {icon} {op['name']}: {op['duration_ms']:,} ms")
             output.append("")
 
-    if not output[-1].strip():
-        output.append("   No specific recommendations at this time.")
+        # Prompt token growth warning
+        react_logs = [log for log in gen_ai_logs if 'ReAct' in get_value(log.get('definition', ''))]
+        if len(react_logs) >= 2:
+            first_prompt = parse_number(get_value(react_logs[0].get('prompt_token_count')))
+            last_prompt = parse_number(get_value(react_logs[-1].get('prompt_token_count')))
+            if first_prompt > 0:
+                growth_pct = ((last_prompt - first_prompt) / first_prompt) * 100
+                if growth_pct > 20:
+                    output.append("Prompt Token Growth:")
+                    output.append(f"  ⚠️ {growth_pct:.1f}% increase detected — scratchpad accumulation")
+                    output.append(f"     Consider summarization strategies to reduce per-turn token cost")
+                    output.append("")
 
-    output.append("")
+        # Tool performance warnings
+        if tool_executions:
+            fastest = min(tool_executions, key=lambda t: parse_number(get_value(t.get('execution_time_ms'))))
+            slowest = max(tool_executions, key=lambda t: parse_number(get_value(t.get('execution_time_ms'))))
+            fastest_ms = parse_number(get_value(fastest.get('execution_time_ms')))
+            slowest_ms = parse_number(get_value(slowest.get('execution_time_ms')))
+
+            output.append("Tool Performance:")
+            output.append(f"  Fastest: {get_value(fastest.get('tool'))} at {fastest_ms:,}ms")
+            output.append(f"  Slowest: {get_value(slowest.get('tool'))} at {slowest_ms:,}ms")
+
+            if slowest_ms > 10000:
+                output.append(f"  ⚠️ {get_value(slowest.get('tool'))} exceeds 10s threshold")
+                output.append(f"     Investigate API latency or consider caching")
+
+            tool_errors = [t for t in tool_executions if get_value(t.get('is_error')) == 'true' and get_value(t.get('error_message'))]
+            if tool_errors:
+                for err_tool in tool_errors:
+                    output.append(f"  ❌ {get_value(err_tool.get('tool'))} failed — {get_value(err_tool.get('error_message'))}")
+            output.append("")
+
+        # Error summary
+        llm_errors = [log for log in gen_ai_logs if get_value(log.get('error')) or get_value(log.get('error_code'))]
+        tool_errors = [t for t in tool_executions if get_value(t.get('is_error')) == 'true' and get_value(t.get('error_message'))]
+
+        output.append("Errors:")
+        output.append(f"  LLM Errors: {len(llm_errors)}")
+        output.append(f"  Tool Errors: {len(tool_errors)}")
+
+        if not llm_errors and not tool_errors:
+            output.append("  ✅ No errors detected")
+        else:
+            for log in llm_errors[:3]:
+                time_str = get_value(log.get('started_at', 'N/A'))
+                error = get_value(log.get('error')) or get_value(log.get('error_code'))
+                output.append(f"    [{time_str}] LLM: {error}")
+            for tool in tool_errors[:3]:
+                time_str = get_value(tool.get('sys_created_on', 'N/A'))
+                error = get_value(tool.get('error_message'))
+                output.append(f"    [{time_str}] TOOL: {error}")
+
+        output.append("")
+    else:
+        output.append("Insufficient data for bottleneck analysis.")
+        output.append("")
+
     output.append("=" * 80)
 
     # ========================================================================
-    # 9. RAW DATA (if requested)
+    # SECTION 7: CONVERSATION MESSAGES (if include_raw_data=true)
     # ========================================================================
 
-    if include_raw_data:
-        output.append("\n" + "=" * 80)
-        output.append("RAW DATA (All Records)")
-        output.append("=" * 80 + "\n")
+    if include_raw_data and messages:
+        output.append("")
+        output.append("💬 CONVERSATION MESSAGES")
+        output.append("=" * 80)
 
-        for table_name, records in loaded_data.items():
-            if records:
-                output.append(f"\n### {table_name} ({len(records)} records)")
-                output.append(json.dumps(records, indent=2))
-                output.append("")
+        for msg in messages:
+            time_str = get_value(msg.get('sys_created_on', ''))
+            if ' ' in time_str:
+                time_only = time_str.split(' ')[1][:8]
+            else:
+                time_only = time_str[:8] if time_str else 'N/A'
+
+            role = get_value(msg.get('role', 'UNKNOWN'))
+            content = get_value(msg.get('content', '(no content)'))[:200]
+
+            output.append(f"[{time_only}] {role}: {content}")
+
+        output.append("")
 
     return "\n".join(output)
 
