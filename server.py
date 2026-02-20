@@ -5584,95 +5584,193 @@ def list_trigger_configurations(
 # AI AGENT WRITE OPERATIONS
 # ============================================================================
 
+def get_strategy_sys_id(strategy_name: str) -> tuple[str, str]:
+    """
+    Look up strategy sys_id by name from sn_aia_strategy table.
+
+    Args:
+        strategy_name: Name of strategy (e.g., "Voice", "ReAct")
+
+    Returns:
+        Tuple of (sys_id, error_message). If successful, error_message is None.
+        If failed, sys_id is None and error_message contains the error.
+
+    Example:
+        sys_id, error = get_strategy_sys_id("Voice")
+        if error:
+            return f"❌ {error}"
+    """
+    url = f"{INSTANCE}/api/now/table/sn_aia_strategy"
+    params = {
+        "sysparm_query": f"name={strategy_name}",
+        "sysparm_fields": "sys_id,name",
+        "sysparm_limit": 1
+    }
+
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            auth=(USERNAME, PASSWORD),
+            headers={"Accept": "application/json"},
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            results = response.json().get("result", [])
+            if results:
+                return results[0].get("sys_id"), None
+            else:
+                return None, f"Strategy '{strategy_name}' not found on this ServiceNow instance. This strategy may not be supported on this instance version."
+        else:
+            return None, f"Error looking up strategy '{strategy_name}': {response.status_code} - {response.text}"
+    except Exception as e:
+        return None, f"Exception looking up strategy '{strategy_name}': {str(e)}"
+
+
 @mcp.tool()
 def create_ai_agent(
     name: str,
     description: str,
     agent_role: str,
     list_of_steps: str,
-    active: bool = True
+    active: bool = True,
+    agent_type: str = "chat"
 ) -> str:
     """
-    Create a new AI agent.
-    
+    Create a new AI agent (Chat or Voice).
+
+    Supports both Chat and Voice agent types. Voice agents are configured
+    with the Voice strategy, Voice agent_type, and NAP and VA channel
+    for Cartesia Sonic-2 TTS compatibility.
+
     Args:
         name: Name of the agent (e.g., "Custom Incident Resolver")
         description: Brief description of what the agent does
         agent_role: The agent's role/purpose (e.g., "Incident resolution specialist")
         list_of_steps: Detailed step-by-step instructions for the agent
         active: Whether the agent is active (default True)
-    
+        agent_type: "chat" (default) or "voice"
+
     Returns:
-        Success message with agent sys_id
+        Success message with agent sys_id, type, and strategy
     """
+    # Validate agent_type
+    VALID_AGENT_TYPES = ["chat", "voice"]
+    agent_type_lower = agent_type.lower()
+
+    if agent_type_lower not in VALID_AGENT_TYPES:
+        return f"❌ Error: agent_type must be one of {VALID_AGENT_TYPES}, got '{agent_type}'"
+
     url = f"{INSTANCE}/api/now/table/sn_aia_agent"
-    
+
     payload = {
         "name": name,
         "description": description,
-        "role": agent_role,  # Fixed: use 'role' instead of 'agent_role'
-        "instructions": list_of_steps,  # Fixed: use 'instructions' instead of 'list_of_steps'
+        "role": agent_role,
+        "instructions": list_of_steps,
         "active": str(active).lower()
     }
-    
+
     response = requests.post(
         url,
         json=payload,
         auth=(USERNAME, PASSWORD),
         headers={"Accept": "application/json", "Content-Type": "application/json"}
     )
-    
-    if response.status_code in [200, 201]:
-        result = response.json().get("result", {})
-        agent_id = result.get("sys_id")
-        
-        # Update the auto-created agent config record to set active status
-        # ServiceNow creates this automatically, we just need to update it
-        config_url = f"{INSTANCE}/api/now/table/sn_aia_agent_config"
-        config_params = {
-            "sysparm_query": f"agent={agent_id}",
-            "sysparm_fields": "sys_id",
-            "sysparm_limit": 1
-        }
-        
-        config_get_response = requests.get(
-            config_url,
-            params=config_params,
-            auth=(USERNAME, PASSWORD),
-            headers={"Accept": "application/json"}
-        )
-        
-        config_updated = False
-        if config_get_response.status_code == 200:
-            config_results = config_get_response.json().get("result", [])
-            if config_results:
-                # Update existing config
-                config_id = config_results[0].get("sys_id")
-                config_update_url = f"{INSTANCE}/api/now/table/sn_aia_agent_config/{config_id}"
-                config_payload = {"active": str(active).lower()}
-                
-                config_update_response = requests.patch(
-                    config_update_url,
-                    json=config_payload,
-                    auth=(USERNAME, PASSWORD),
-                    headers={"Accept": "application/json", "Content-Type": "application/json"}
-                )
-                
-                config_updated = config_update_response.status_code == 200
-        
-        return (
-            f"✅ AI Agent created successfully!\n\n"
-            f"Name: {name}\n"
-            f"Sys ID: {agent_id}\n"
-            f"Active: {active}"
-            + (f" (config updated)" if config_updated else f" (auto-created)")
-            + f"\n\nNext steps:\n"
-            f"1. Add tools to the agent using add_tool_to_agent\n"
-            f"2. Associate with workflows using create_agentic_workflow or update_agentic_workflow\n"
-            f"3. Test the agent in AI Agent Studio"
-        )
-    else:
+
+    if response.status_code not in [200, 201]:
         return f"❌ Error creating agent: {response.status_code} - {response.text}"
+
+    result = response.json().get("result", {})
+    agent_id = result.get("sys_id")
+
+    # Determine strategy based on agent type
+    strategy_name = "Voice" if agent_type_lower == "voice" else "ReAct"
+    strategy_sys_id, strategy_error = get_strategy_sys_id(strategy_name)
+
+    if strategy_error:
+        return (
+            f"⚠️ Agent created but configuration incomplete!\n\n"
+            f"Agent ID: {agent_id}\n"
+            f"Error: {strategy_error}\n\n"
+            f"Please manually set the strategy on the agent record."
+        )
+
+    # Update agent with strategy and type-specific fields
+    agent_update_url = f"{INSTANCE}/api/now/table/sn_aia_agent/{agent_id}"
+    agent_update_payload = {
+        "strategy": strategy_sys_id
+    }
+
+    # Add voice-specific fields
+    if agent_type_lower == "voice":
+        agent_update_payload["agent_type"] = "Voice"
+        agent_update_payload["channel"] = "NAP and VA"
+
+    agent_update_response = requests.patch(
+        agent_update_url,
+        json=agent_update_payload,
+        auth=(USERNAME, PASSWORD),
+        headers={"Accept": "application/json", "Content-Type": "application/json"}
+    )
+
+    if agent_update_response.status_code != 200:
+        return (
+            f"⚠️ Agent created but {agent_type_lower} configuration failed!\n\n"
+            f"Agent ID: {agent_id}\n"
+            f"Error: {agent_update_response.status_code} - {agent_update_response.text}\n\n"
+            f"Please manually set: strategy={strategy_name}"
+            + (", agent_type=Voice, channel=NAP and VA" if agent_type_lower == "voice" else "")
+        )
+
+    # Update the auto-created agent config record to set active status
+    config_url = f"{INSTANCE}/api/now/table/sn_aia_agent_config"
+    config_params = {
+        "sysparm_query": f"agent={agent_id}",
+        "sysparm_fields": "sys_id",
+        "sysparm_limit": 1
+    }
+
+    config_get_response = requests.get(
+        config_url,
+        params=config_params,
+        auth=(USERNAME, PASSWORD),
+        headers={"Accept": "application/json"}
+    )
+
+    config_updated = False
+    if config_get_response.status_code == 200:
+        config_results = config_get_response.json().get("result", [])
+        if config_results:
+            config_id = config_results[0].get("sys_id")
+            config_update_url = f"{INSTANCE}/api/now/table/sn_aia_agent_config/{config_id}"
+            config_payload = {"active": str(active).lower()}
+
+            config_update_response = requests.patch(
+                config_update_url,
+                json=config_payload,
+                auth=(USERNAME, PASSWORD),
+                headers={"Accept": "application/json", "Content-Type": "application/json"}
+            )
+
+            config_updated = config_update_response.status_code == 200
+
+    agent_type_display = "Voice" if agent_type_lower == "voice" else "Chat"
+
+    return (
+        f"✅ {agent_type_display} AI Agent created successfully!\n\n"
+        f"Name: {name}\n"
+        f"Sys ID: {agent_id}\n"
+        f"Type: {agent_type_display}\n"
+        f"Strategy: {strategy_name}\n"
+        f"Active: {active}"
+        + (f" (config updated)" if config_updated else f" (auto-created)")
+        + f"\n\nNext steps:\n"
+        f"1. Add tools to the agent using add_tool_to_agent\n"
+        f"2. Associate with workflows using create_agentic_workflow or update_agentic_workflow\n"
+        f"3. Test the agent in " + ("Virtual Agent" if agent_type_lower == "voice" else "AI Agent Studio")
+    )
 
 
 @mcp.tool()
@@ -5682,11 +5780,12 @@ def update_ai_agent(
     description: str = "",
     agent_role: str = "",
     list_of_steps: str = "",
-    active: str = ""
+    active: str = "",
+    agent_type: str = ""
 ) -> str:
     """
     Update an existing AI agent. Only provide fields you want to update.
-    
+
     Args:
         agent_sys_id: Sys ID of the agent to update (required)
         name: New name (optional)
@@ -5694,31 +5793,42 @@ def update_ai_agent(
         agent_role: New role (optional)
         list_of_steps: New instructions (optional)
         active: New active status - "true" or "false" (optional)
-    
+        agent_type: New agent type - "chat" or "voice" (optional)
+
     Returns:
         Success message with updated fields
     """
     url = f"{INSTANCE}/api/now/table/sn_aia_agent/{agent_sys_id}"
-    
-    # Separate active from other fields since it goes in a different table
+
+    # Separate active and agent_type from other fields
     active_value = None
     if active:
         active_value = active
-        # Don't include active in the main agent payload
-    
-    # Only include fields that were provided (excluding active)
+
+    # Validate and process agent_type if provided
+    agent_type_value = None
+    if agent_type:
+        VALID_AGENT_TYPES = ["chat", "voice"]
+        agent_type_lower = agent_type.lower()
+
+        if agent_type_lower not in VALID_AGENT_TYPES:
+            return f"❌ Error: agent_type must be one of {VALID_AGENT_TYPES}, got '{agent_type}'"
+
+        agent_type_value = agent_type_lower
+
+    # Only include fields that were provided (excluding active and agent_type)
     payload = {}
     if name:
         payload["name"] = name
     if description:
         payload["description"] = description
     if agent_role:
-        payload["role"] = agent_role  # Fixed: use 'role' instead of 'agent_role'
+        payload["role"] = agent_role
     if list_of_steps:
-        payload["instructions"] = list_of_steps  # Fixed: use 'instructions' instead of 'list_of_steps'
-    
+        payload["instructions"] = list_of_steps
+
     updated_fields = []
-    
+
     # Update the main agent record if there are fields to update
     if payload:
         response = requests.patch(
@@ -5727,43 +5837,76 @@ def update_ai_agent(
             auth=(USERNAME, PASSWORD),
             headers={"Accept": "application/json", "Content-Type": "application/json"}
         )
-        
+
         if response.status_code != 200:
             return f"❌ Error updating agent: {response.status_code} - {response.text}"
-        
+
         updated_fields = list(payload.keys())
-    
+
+    # Update agent type and strategy if provided
+    if agent_type_value:
+        strategy_name = "Voice" if agent_type_value == "voice" else "ReAct"
+        strategy_sys_id, strategy_error = get_strategy_sys_id(strategy_name)
+
+        if strategy_error:
+            return f"❌ Error: {strategy_error}"
+
+        type_payload = {
+            "strategy": strategy_sys_id
+        }
+
+        # Add voice-specific fields
+        if agent_type_value == "voice":
+            type_payload["agent_type"] = "Voice"
+            type_payload["channel"] = "NAP and VA"
+        else:
+            # Clear voice-specific fields for chat agents
+            type_payload["agent_type"] = ""
+            type_payload["channel"] = ""
+
+        type_response = requests.patch(
+            url,
+            json=type_payload,
+            auth=(USERNAME, PASSWORD),
+            headers={"Accept": "application/json", "Content-Type": "application/json"}
+        )
+
+        if type_response.status_code != 200:
+            return f"❌ Error updating agent type: {type_response.status_code} - {type_response.text}"
+
+        agent_type_display = "Voice" if agent_type_value == "voice" else "Chat"
+        updated_fields.append(f"agent_type ({agent_type_display})")
+        updated_fields.append(f"strategy ({strategy_name})")
+
     # Update active status in config table if provided
     if active_value:
-        # Find the config record
         config_url = f"{INSTANCE}/api/now/table/sn_aia_agent_config"
         config_params = {
             "sysparm_query": f"agent={agent_sys_id}",
             "sysparm_limit": 1,
             "sysparm_fields": "sys_id"
         }
-        
+
         config_response = requests.get(
             config_url, params=config_params,
             auth=(USERNAME, PASSWORD),
             headers={"Accept": "application/json"}
         )
-        
+
         if config_response.status_code == 200:
             config_results = config_response.json().get("result", [])
             if config_results:
-                # Update existing config
                 config_id = config_results[0].get("sys_id")
                 config_update_url = f"{INSTANCE}/api/now/table/sn_aia_agent_config/{config_id}"
                 config_payload = {"active": active_value.lower()}
-                
+
                 config_update = requests.patch(
                     config_update_url,
                     json=config_payload,
                     auth=(USERNAME, PASSWORD),
                     headers={"Accept": "application/json", "Content-Type": "application/json"}
                 )
-                
+
                 if config_update.status_code == 200:
                     updated_fields.append("active (in config)")
             else:
@@ -5772,20 +5915,20 @@ def update_ai_agent(
                     "agent": agent_sys_id,
                     "active": active_value.lower()
                 }
-                
+
                 config_create = requests.post(
                     config_url,
                     json=config_create_payload,
                     auth=(USERNAME, PASSWORD),
                     headers={"Accept": "application/json", "Content-Type": "application/json"}
                 )
-                
+
                 if config_create.status_code in [200, 201]:
                     updated_fields.append("active (config created)")
-    
+
     if not updated_fields:
         return "❌ Error: No fields provided to update. Specify at least one field to change."
-    
+
     return (
         f"✅ AI Agent updated successfully!\n\n"
         f"Agent ID: {agent_sys_id}\n"
