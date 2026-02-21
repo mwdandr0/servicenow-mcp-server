@@ -4124,17 +4124,19 @@ def find_va_agent_execution_plan(
 
 @mcp.tool()
 def analyze_conversation_performance(
-    conversation_sys_id: str,
+    conversation_sys_id: str = "",
+    agent_name: str = "",
     include_raw_data: bool = False
 ) -> str:
     """
     Comprehensive AI Agent conversation performance analysis with accurate timing and error reporting.
 
-    Auto-resolves input (handles both conversation sys_id and execution_plan sys_id).
+    Auto-resolves input (handles conversation sys_id, execution_plan sys_id, OR agent name).
     Correlates data across 7 tables to build complete performance picture.
 
     Args:
-        conversation_sys_id: sys_id of sys_cs_conversation OR sn_aia_execution_plan
+        conversation_sys_id: sys_id of sys_cs_conversation OR sn_aia_execution_plan (optional if agent_name provided)
+        agent_name: Name of the agent to analyze (finds most recent execution) (optional if conversation_sys_id provided)
         include_raw_data: If True, includes conversation messages at end
 
     Returns:
@@ -4152,6 +4154,33 @@ def analyze_conversation_performance(
 
     client = get_client()
     output = []
+
+    # Validate input parameters
+    if not conversation_sys_id and not agent_name:
+        return "Error: Must provide either conversation_sys_id or agent_name"
+
+    # ========================================================================
+    # STEP 0: AGENT NAME SEARCH (if provided)
+    # ========================================================================
+    if agent_name and not conversation_sys_id:
+        # Search for most recent execution plan for this agent
+        agent_search = client.table_get(
+            table="sn_aia_execution_plan",
+            query=f"agent.nameLIKE{agent_name}^ORDERBYDESCsys_created_on",
+            fields=["sys_id", "agent.name", "objective", "sys_created_on"],
+            limit=1,
+            display_value="true"
+        )
+
+        if not agent_search["success"] or not agent_search["data"].get("result"):
+            return f"Error: No execution plans found for agent '{agent_name}'. Check the agent name and try again."
+
+        execution_found = agent_search["data"]["result"][0]
+        conversation_sys_id = execution_found.get("sys_id")
+        output.append(f"🔍 Found execution for agent: {execution_found.get('agent.name', agent_name)}")
+        output.append(f"   Objective: {execution_found.get('objective', 'N/A')}")
+        output.append(f"   Created: {execution_found.get('sys_created_on', 'N/A')}")
+        output.append("")
 
     # ========================================================================
     # STEP 1: INPUT PARAMETER RESOLUTION
