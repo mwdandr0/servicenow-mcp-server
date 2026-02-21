@@ -3435,26 +3435,22 @@ def list_agentic_workflows(
 
 @mcp.tool()
 def list_ai_agents(
-    active_only: bool = True,
     limit: int = 50
 ) -> str:
     """
     List all AI agents configured in the system.
-    
+
+    Note: The 'active' status is stored in sn_aia_agent_config, not sn_aia_agent.
+    Use get_agent_details() to check if a specific agent is active.
+
     Args:
-        active_only: Only show active agents (default True)
         limit: Max number of records to return (default 50)
     """
-    query_parts = []
-    if active_only:
-        query_parts.append("active=true")
-    query = "^".join(query_parts) if query_parts else ""
-    
     url = f"{INSTANCE}/api/now/table/sn_aia_agent"
     params = {
-        "sysparm_query": f"{query}^ORDERBYDESCsys_created_on" if query else "ORDERBYDESCsys_created_on",
+        "sysparm_query": "ORDERBYDESCsys_created_on",
         "sysparm_limit": limit,
-        "sysparm_fields": "sys_id,name,description,active,agent_role,sys_created_on,sys_updated_on"
+        "sysparm_fields": "sys_id,name,description,role,sys_created_on,sys_updated_on"
     }
 
     response = requests.get(
@@ -3475,11 +3471,11 @@ def list_ai_agents(
         output.append(
             f"Name: {agent.get('name', 'N/A')}\n"
             f"Sys ID: {agent.get('sys_id')}\n"
-            f"Active: {agent.get('active', 'N/A')}\n"
-            f"Role: {agent.get('agent_role', 'N/A')}\n"
+            f"Role: {agent.get('role', 'N/A')}\n"
             f"Description: {agent.get('description', 'N/A')}\n"
             f"Created: {agent.get('sys_created_on', 'N/A')}\n"
-            f"Updated: {agent.get('sys_updated_on', 'N/A')}"
+            f"Updated: {agent.get('sys_updated_on', 'N/A')}\n"
+            f"(Use get_agent_details for active status)"
         )
     return "\n\n---\n\n".join(output)
 
