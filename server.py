@@ -6736,6 +6736,230 @@ def clone_ai_agent(
     )
 
 
+@mcp.tool()
+def run_ai_agent(
+    agent_identifier: str,
+    objective: str,
+    target_table: str = "",
+    target_record_id: str = "",
+    conversation_user: str = "",
+    conversation_label: str = "",
+    context_memory: str = "",
+    can_interact_with_user: bool = False,
+    wait_for_completion: bool = True,
+    poll_timeout_seconds: int = 60
+) -> str:
+    """
+    Invoke a ServiceNow AI Agent using the official AiAgentRuntimeUtil Script Include.
+
+    Executes server-side JavaScript via background script API to call
+    sn_aia.AiAgentRuntimeUtil().startAiAgentConversation(request), which is
+    the documented ServiceNow AI Agent invocation method.
+
+    Args:
+        agent_identifier: Agent name or sys_id (use list_ai_agents() to find)
+        objective: The goal or task to give the agent (e.g. "Resolve incident INC001")
+        target_table: Optional table of the context record (e.g. "incident")
+        target_record_id: Optional sys_id of the context record
+        conversation_user: Optional sys_id of the user running the conversation
+                           (defaults to the service account session user)
+        conversation_label: Optional label for this conversation
+        context_memory: Optional JSON string of prior conversation for back-and-forth.
+                        Format: '{\"conversation\": [{\"from\": \"You\", \"message\": \"...\"},
+                                                     {\"from\": \"Agent\", \"message\": \"...\"}]}'
+        can_interact_with_user: Allow agent to ask clarifying questions (default: False
+                                for automated/non-interactive runs)
+        wait_for_completion: Poll the execution plan until agent finishes (default: True)
+        poll_timeout_seconds: Max seconds to wait for completion (default: 60, max: 300)
+
+    Returns:
+        JSON with:
+        - conversation_id: sys_id of the sn_aia_conversation record
+        - execution_plan_id: sys_id of the sn_aia_execution_plan record
+        - status: Agent execution state (running / completed / error)
+        - agent_response: Final agent output once completed
+        - structured_output: Structured output if agent used structuredOutputRequest
+        - next_steps: How to continue the conversation or check status
+
+    Examples:
+        # Simple invocation
+        run_ai_agent("IT Support Agent", "My laptop won't connect to WiFi")
+
+        # With a context record
+        run_ai_agent("Incident Analyst", "Summarize and suggest a resolution",
+                     target_table="incident", target_record_id="abc123def456")
+
+        # Continue a conversation (pass prior history in context_memory)
+        run_ai_agent("Incident Analyst", "Looks good, go ahead with that plan",
+                     target_record_id="abc123def456",
+                     context_memory='{"conversation": [{"from": "You", "message": "Analyze INC001"},
+                                                       {"from": "Agent", "message": "I suggest..."}]}')
+
+    Note:
+        Requires the service account to have the 'sn_aia.user' role and
+        background script execution rights. Uses AiAgentRuntimeUtil internally.
+    """
+    import time as _time
+    client = get_client()
+
+    # Step 1: Resolve agent name to sys_id if needed
+    agent_sys_id = agent_identifier
+    agent_name = agent_identifier
+
+    if len(agent_identifier) != 32 or not agent_identifier.isalnum():
+        lookup = client.table_get(
+            table="sn_aia_agent",
+            query=f"nameLIKE{agent_identifier}",
+            fields=["sys_id", "name"],
+            limit=1
+        )
+        if lookup["success"] and lookup["data"].get("result"):
+            rec = lookup["data"]["result"][0]
+            agent_sys_id = rec.get("sys_id")
+            agent_name = rec.get("name")
+        else:
+            return json.dumps({
+                "success": False,
+                "error": f"Agent not found: '{agent_identifier}'",
+                "hint": "Use list_ai_agents() to see available agents and their sys_ids"
+            }, indent=2)
+
+    # Step 2: Build the server-side JavaScript that calls AiAgentRuntimeUtil
+    # Safely escape the objective and context_memory for embedding in JS
+    safe_objective = objective.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    safe_label = (conversation_label or objective[:60]).replace("\\", "\\\\").replace('"', '\\"')
+    can_interact_str = "true" if can_interact_with_user else "false"
+
+    script_lines = [
+        "var request = {};",
+        f'request.agentId = "{agent_sys_id}";',
+        f'request.objective = "{safe_objective}";',
+        f'request.canInteractWithUser = {can_interact_str};',
+        f'request.conversationLabel = "{safe_label}";',
+    ]
+
+    if target_table:
+        script_lines.append(f'request.targetTable = "{target_table}";')
+    if target_record_id:
+        script_lines.append(f'request.targetRecordId = "{target_record_id}";')
+    if conversation_user:
+        script_lines.append(f'request.conversationUser = "{conversation_user}";')
+    if context_memory:
+        safe_ctx = context_memory.replace("\\", "\\\\").replace("'", "\\'")
+        script_lines.append(f"request.contextMemory = '{safe_ctx}';")
+
+    script_lines += [
+        "var util = new sn_aia.AiAgentRuntimeUtil();",
+        "var response = util.startAiAgentConversation(request);",
+        "return JSON.stringify(response);"
+    ]
+
+    script = "\n".join(script_lines)
+
+    # Step 3: Execute the script via background script REST API
+    exec_result = client._request(
+        "POST",
+        "/api/now/script",
+        data={"script": script}
+    )
+
+    if not exec_result["success"]:
+        return json.dumps({
+            "success": False,
+            "error": exec_result["error"],
+            "agent": agent_name,
+            "hint": (
+                "Script execution failed. Ensure the service account has the "
+                "'script_processor' role and 'sn_aia.user' role. "
+                "The /api/now/script endpoint requires elevated permissions."
+            ),
+            "script_used": script
+        }, indent=2)
+
+    # Step 4: Parse the Script Include response
+    raw_output = exec_result["data"]
+    agent_response_str = None
+
+    if isinstance(raw_output, dict):
+        agent_response_str = raw_output.get("result") or raw_output.get("output")
+    elif isinstance(raw_output, str):
+        agent_response_str = raw_output
+
+    try:
+        agent_resp = json.loads(agent_response_str) if agent_response_str else {}
+    except (json.JSONDecodeError, TypeError):
+        agent_resp = {"raw": agent_response_str}
+
+    if agent_resp.get("status") == "error":
+        return json.dumps({
+            "success": False,
+            "error": agent_resp.get("error", {}).get("message", "Unknown error"),
+            "error_code": agent_resp.get("error", {}).get("code", ""),
+            "agent": agent_name
+        }, indent=2)
+
+    conversation_id = agent_resp.get("data", {}).get("conversationId", "")
+    execution_plan_id = agent_resp.get("data", {}).get("executionPlanId", "")
+
+    result = {
+        "success": True,
+        "agent_name": agent_name,
+        "agent_sys_id": agent_sys_id,
+        "conversation_id": conversation_id,
+        "execution_plan_id": execution_plan_id,
+        "status": "running",
+        "agent_response": None,
+        "structured_output": None
+    }
+
+    # Step 5: Optionally poll execution plan for completion
+    if wait_for_completion and execution_plan_id:
+        timeout = min(poll_timeout_seconds, 300)
+        poll_interval = 5
+        elapsed = 0
+
+        while elapsed < timeout:
+            _time.sleep(poll_interval)
+            elapsed += poll_interval
+
+            plan = client.table_get(
+                table="sn_aia_execution_plan",
+                sys_id=execution_plan_id,
+                fields=["state", "output", "structured_output_response",
+                        "error_message", "sys_updated_on"],
+                display_value="all"
+            )
+
+            if plan["success"] and plan["data"].get("result"):
+                plan_data = plan["data"]["result"]
+                state = plan_data.get("state", "")
+                result["status"] = state
+
+                if state in ("completed", "complete", "4"):
+                    result["agent_response"] = plan_data.get("output", "")
+                    result["structured_output"] = plan_data.get("structured_output_response", "")
+                    result["elapsed_seconds"] = elapsed
+                    break
+                elif state in ("error", "failed", "5"):
+                    result["status"] = "failed"
+                    result["error"] = plan_data.get("error_message", "Agent execution failed")
+                    break
+
+        if result["status"] == "running":
+            result["next_steps"] = (
+                f"Agent still running after {timeout}s. "
+                f"Use query_execution_plans() with execution_plan_id='{execution_plan_id}' "
+                "to check status, or get_execution_details() for full details."
+            )
+    else:
+        result["next_steps"] = (
+            f"Use query_execution_plans() with execution_plan_id='{execution_plan_id}' "
+            "to check when the agent completes and retrieve the response."
+        )
+
+    return json.dumps(result, indent=2)
+
+
 # ============================================================================
 # AI SEARCH TOOLS
 # ============================================================================
@@ -9094,3 +9318,312 @@ def query_syslog(
             "Check transaction_id to correlate related log entries"
         ]
     }, indent=2)
+
+
+# =============================================================================
+# MCP RESOURCES (Expose ServiceNow data as context)
+# =============================================================================
+
+@mcp.resource("snow://schema/{table}")
+def get_table_schema(table: str) -> str:
+    """
+    Expose ServiceNow table schema as a resource.
+
+    This allows LLMs to understand table structures and field definitions
+    when working with ServiceNow data.
+    """
+    client = get_client()
+
+    # Get dictionary entry for the table
+    result = client.table_get(
+        table="sys_dictionary",
+        query=f"name={table}",
+        fields=["element", "column_label", "internal_type", "max_length",
+                "mandatory", "reference", "choice"],
+        limit=1000
+    )
+
+    if not result["success"]:
+        return f"Error retrieving schema for table '{table}': {result['error']}"
+
+    fields = result["data"].get("result", [])
+
+    if not fields:
+        return f"Table '{table}' not found or has no fields defined"
+
+    # Format schema as markdown
+    schema_md = f"# ServiceNow Table Schema: {table}\n\n"
+    schema_md += "| Field | Label | Type | Required | Reference |\n"
+    schema_md += "|-------|-------|------|----------|----------|\n"
+
+    for field in fields:
+        element = field.get("element", "")
+        label = field.get("column_label", "")
+        field_type = field.get("internal_type", "")
+        mandatory = "✓" if field.get("mandatory") == "true" else ""
+        reference = field.get("reference", "")
+
+        schema_md += f"| {element} | {label} | {field_type} | {mandatory} | {reference} |\n"
+
+    schema_md += f"\n**Total Fields:** {len(fields)}\n"
+
+    return schema_md
+
+
+@mcp.resource("snow://record/{table}/{sys_id}")
+def get_record_content(table: str, sys_id: str) -> str:
+    """
+    Expose a specific ServiceNow record as a resource.
+
+    This allows LLMs to access full record details as context.
+    """
+    client = get_client()
+
+    result = client.table_get(
+        table=table,
+        sys_id=sys_id,
+        display_value="all"
+    )
+
+    if not result["success"]:
+        return f"Error retrieving {table} record {sys_id}: {result['error']}"
+
+    record = result["data"].get("result")
+
+    if not record:
+        return f"Record not found: {table}/{sys_id}"
+
+    # Format record as markdown
+    record_md = f"# ServiceNow Record: {table}\n\n"
+    record_md += f"**Sys ID:** {sys_id}\n\n"
+    record_md += "## Fields\n\n"
+
+    for key, value in sorted(record.items()):
+        if key.startswith("sys_"):
+            continue  # Skip system fields for brevity
+
+        # Handle display values
+        if isinstance(value, dict) and "display_value" in value:
+            display = value.get("display_value", "")
+            record_md += f"**{key}:** {display}\n"
+        else:
+            record_md += f"**{key}:** {value}\n"
+
+    return record_md
+
+
+@mcp.resource("snow://tables")
+def list_common_tables() -> str:
+    """
+    Static resource listing common ServiceNow tables.
+
+    Provides quick reference for table names and purposes.
+    """
+    return """# Common ServiceNow Tables
+
+## Core Tables
+- **incident** - Incident management
+- **problem** - Problem management
+- **change_request** - Change management
+- **sc_request** - Service Catalog requests
+- **sc_req_item** - Service Catalog requested items
+- **sc_cat_item** - Service Catalog items
+- **sys_user** - User records
+- **sys_user_group** - User groups
+- **cmdb_ci** - Configuration items
+
+## AI Agent Tables
+- **sn_aia_agent** - AI Agent definitions
+- **sn_aia_agent_config** - AI Agent configurations
+- **sn_aia_execution_plan** - AI Agent execution plans
+- **sn_aia_conversation** - AI Agent conversations
+- **sn_aia_invocation** - AI Agent invocations
+
+## Task Tables
+- **task** - Base task table (parent of incident, problem, change)
+- **sc_task** - Catalog tasks
+- **kb_knowledge** - Knowledge base articles
+
+## System Tables
+- **sys_dictionary** - Table/field definitions
+- **syslog** - System logs
+- **sys_journal_field** - Journal/comment entries
+"""
+
+
+# =============================================================================
+# MCP PROMPTS (Reusable prompt templates)
+# =============================================================================
+
+@mcp.prompt()
+def analyze_agent() -> str:
+    """
+    Prompt template for analyzing AI Agent performance.
+
+    Guides the user through a comprehensive agent analysis workflow.
+    """
+    return """I'll help you analyze an AI Agent's performance. Let's gather the key metrics:
+
+1. **Agent Selection**
+   - What's the agent name or sys_id?
+   - Use `list_ai_agents()` if you need to find it
+
+2. **Performance Analysis**
+   - Use `analyze_conversation_performance()` to get:
+     - Total conversations and success rate
+     - Average response time
+     - User wait time analysis
+     - Error patterns
+     - Common failure points
+
+3. **Recent Activity**
+   - Use `query_execution_plans()` to see recent executions
+   - Filter by date range to focus on specific timeframe
+   - Look for patterns in failures or slow responses
+
+4. **Configuration Review**
+   - Use `get_agent_config()` to verify:
+     - Tool availability
+     - Model selection
+     - System prompts
+     - Guardrails and limits
+
+5. **Recommendations**
+   - Based on the data, suggest optimizations:
+     - Tool usage patterns
+     - Response time improvements
+     - Error handling enhancements
+     - Configuration tuning
+
+Let's start - which agent would you like to analyze?"""
+
+
+@mcp.prompt()
+def troubleshoot_workflow() -> str:
+    """
+    Prompt template for debugging ServiceNow workflows.
+
+    Provides a structured approach to workflow troubleshooting.
+    """
+    return """I'll help you troubleshoot a workflow issue. Let's follow this diagnostic process:
+
+1. **Identify the Workflow**
+   - What's the workflow name or sys_id?
+   - Which record/task is affected?
+   - When did the issue start?
+
+2. **Check Workflow Context**
+   - Use `get_workflow_context()` to see:
+     - Current workflow state
+     - Execution history
+     - Activity completions
+     - Waiting activities
+
+3. **Review System Logs**
+   - Use `query_syslog()` to find:
+     - Workflow errors
+     - Script errors
+     - Integration failures
+   - Filter by timeframe and source
+
+4. **Analyze the Record**
+   - Check the affected record's state
+   - Review journal entries for clues
+   - Verify field values match workflow conditions
+
+5. **Common Issues to Check**
+   - Approval stuck? Check approver assignment
+   - Activity waiting? Verify conditions are met
+   - Script error? Review error messages in syslog
+   - Integration failed? Check API credentials/connectivity
+
+6. **Resolution Steps**
+   - Based on findings, recommend fixes
+   - Provide specific actions to take
+   - Suggest preventive measures
+
+What's the workflow or record you're troubleshooting?"""
+
+
+@mcp.prompt()
+def create_incident() -> str:
+    """
+    Prompt template for guided incident creation.
+
+    Ensures all required information is collected before creating an incident.
+    """
+    return """I'll help you create a ServiceNow incident. Let me gather the required information:
+
+1. **Caller/Requester** (Required)
+   - Who is reporting this incident?
+   - Provide their email or username
+   - I'll use `get_user_context()` to look them up
+
+2. **Incident Details** (Required)
+   - **Short Description:** Brief summary of the issue
+   - **Description:** Detailed explanation of the problem
+   - **Impact:** How many users affected? (1-user, 2-multiple, 3-large group)
+   - **Urgency:** How quickly needs resolution? (1-high, 2-medium, 3-low)
+
+3. **Assignment** (Optional)
+   - **Assignment Group:** Which team should handle this?
+   - **Assigned To:** Specific person? (leave blank for group routing)
+
+4. **Classification** (Optional but recommended)
+   - **Category:** Type of issue (software, hardware, network, etc.)
+   - **Subcategory:** More specific classification
+   - **Configuration Item:** Affected system/service
+
+5. **Additional Information** (Optional)
+   - **Work Notes:** Internal notes for support team
+   - **Related Records:** Link to change, problem, or other incidents
+
+Once I have this information, I'll:
+- Validate the caller exists
+- Auto-calculate Priority based on Impact + Urgency
+- Create the incident with `create_incident()`
+- Provide the incident number (INC...)
+
+Let's start - who is the caller for this incident?"""
+
+
+@mcp.prompt()
+def order_catalog_item() -> str:
+    """
+    Prompt template for ordering from Service Catalog.
+
+    Follows the documented workflow from CLAUDE.md.
+    """
+    return """I'll help you order from the Service Catalog. Let me guide you through the process:
+
+1. **Who is this order for?** (Required)
+   - Provide email, username, or name
+   - I'll use `get_user_context()` to get their sys_id
+   - ⚠️ Important: I need this to set `requested_for` parameter
+
+2. **What do you need?**
+   - Tell me what you're looking for
+   - I'll use `search_catalog_items()` to find matches
+
+3. **Select the Item**
+   - I'll show you the available options
+   - You choose which one you want
+
+4. **Configure the Item**
+   - I'll use `get_catalog_item_details()` to see what's needed
+   - I'll ask for any required variables (storage, memory, color, etc.)
+
+5. **Submit the Order**
+   - I'll use `order_catalog_item()` with:
+     - The catalog item sys_id
+     - Your variable choices
+     - The `requested_for` user sys_id
+
+6. **Confirmation**
+   - I'll provide:
+     - Request number (REQ...)
+     - Request item number (RITM...)
+     - Order summary
+     - Who it was ordered for
+
+Let's start - who is this order for?"""
