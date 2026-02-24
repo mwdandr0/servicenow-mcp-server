@@ -6824,43 +6824,31 @@ def run_ai_agent(
                 "hint": "Use list_ai_agents() to see available agents and their sys_ids"
             }, indent=2)
 
-    # Step 2: Build the server-side JavaScript that calls AiAgentRuntimeUtil
-    # Safely escape the objective and context_memory for embedding in JS
-    safe_objective = objective.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    safe_label = (conversation_label or objective[:60]).replace("\\", "\\\\").replace('"', '\\"')
-    can_interact_str = "true" if can_interact_with_user else "false"
-
-    script_lines = [
-        "var request = {};",
-        f'request.agentId = "{agent_sys_id}";',
-        f'request.objective = "{safe_objective}";',
-        f'request.canInteractWithUser = {can_interact_str};',
-        f'request.conversationLabel = "{safe_label}";',
-    ]
+    # Step 2: Build the JSON payload for the Scripted REST API
+    # One-time setup required: create Scripted REST API on the instance
+    # named "AI Agent Invoker" with API ID "ai_agent_invoker" and a POST
+    # resource at /invoke that calls sn_aia.AiAgentRuntimeUtil().startAiAgentConversation()
+    payload = {
+        "agentId": agent_sys_id,
+        "objective": objective,
+        "canInteractWithUser": can_interact_with_user,
+        "conversationLabel": conversation_label or objective[:60]
+    }
 
     if target_table:
-        script_lines.append(f'request.targetTable = "{target_table}";')
+        payload["targetTable"] = target_table
     if target_record_id:
-        script_lines.append(f'request.targetRecordId = "{target_record_id}";')
+        payload["targetRecordId"] = target_record_id
     if conversation_user:
-        script_lines.append(f'request.conversationUser = "{conversation_user}";')
+        payload["conversationUser"] = conversation_user
     if context_memory:
-        safe_ctx = context_memory.replace("\\", "\\\\").replace("'", "\\'")
-        script_lines.append(f"request.contextMemory = '{safe_ctx}';")
+        payload["contextMemory"] = context_memory
 
-    script_lines += [
-        "var util = new sn_aia.AiAgentRuntimeUtil();",
-        "var response = util.startAiAgentConversation(request);",
-        "return JSON.stringify(response);"
-    ]
-
-    script = "\n".join(script_lines)
-
-    # Step 3: Execute the script via background script REST API
+    # Step 3: Call the Scripted REST API endpoint
     exec_result = client._request(
         "POST",
-        "/api/now/script",
-        data={"script": script}
+        "/api/global/ai_agent_invoker/invoke",
+        data=payload
     )
 
     if not exec_result["success"]:
@@ -6869,26 +6857,23 @@ def run_ai_agent(
             "error": exec_result["error"],
             "agent": agent_name,
             "hint": (
-                "Script execution failed. Ensure the service account has the "
-                "'script_processor' role and 'sn_aia.user' role. "
-                "The /api/now/script endpoint requires elevated permissions."
-            ),
-            "script_used": script
+                "Could not reach the AI Agent Invoker API. "
+                "One-time setup required: in ServiceNow go to "
+                "System Web Services > Scripted REST APIs > New, "
+                "create a service with API ID 'ai_agent_invoker' in global scope, "
+                "add a POST resource at /invoke that calls "
+                "sn_aia.AiAgentRuntimeUtil().startAiAgentConversation(request.body.data). "
+                "Also ensure the service account has the 'sn_aia.user' role."
+            )
         }, indent=2)
 
-    # Step 4: Parse the Script Include response
-    raw_output = exec_result["data"]
-    agent_response_str = None
-
-    if isinstance(raw_output, dict):
-        agent_response_str = raw_output.get("result") or raw_output.get("output")
-    elif isinstance(raw_output, str):
-        agent_response_str = raw_output
-
-    try:
-        agent_resp = json.loads(agent_response_str) if agent_response_str else {}
-    except (json.JSONDecodeError, TypeError):
-        agent_resp = {"raw": agent_response_str}
+    # Step 4: Parse the Script Include response (status / data / error)
+    agent_resp = exec_result["data"] or {}
+    if isinstance(agent_resp, str):
+        try:
+            agent_resp = json.loads(agent_resp)
+        except (json.JSONDecodeError, TypeError):
+            agent_resp = {"raw": agent_resp}
 
     if agent_resp.get("status") == "error":
         return json.dumps({
