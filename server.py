@@ -6750,54 +6750,76 @@ def run_ai_agent(
     poll_timeout_seconds: int = 60
 ) -> str:
     """
-    Invoke a ServiceNow AI Agent using the official AiAgentRuntimeUtil Script Include.
+    Invoke a ServiceNow AI Agent via the OOB AI Agent Invoker API.
 
-    Executes server-side JavaScript via background script API to call
-    sn_aia.AiAgentRuntimeUtil().startAiAgentConversation(request), which is
-    the documented ServiceNow AI Agent invocation method.
+    Calls POST /api/snc/ai_agent_invoker_api/start_conversation which wraps
+    sn_aia.AiAgentRuntimeUtil().startAiAgentConversation(). Optionally polls
+    sn_aia_execution_plan until the agent completes and returns its response.
 
     Args:
         agent_identifier: Agent name or sys_id (use list_ai_agents() to find)
-        objective: The goal or task to give the agent (e.g. "Resolve incident INC001")
+        objective: The task to give the agent. IMPORTANT: when can_interact_with_user=False
+                   (the default), the agent runs in autonomous mode and CANNOT ask follow-up
+                   questions. The objective must be fully self-contained with all required
+                   inputs, sys_ids, and specifics included. Vague objectives will cause the
+                   agent to fail with "restricted Action: collect_input_from_user".
         target_table: Optional table of the context record (e.g. "incident")
         target_record_id: Optional sys_id of the context record
-        conversation_user: Optional sys_id of the user running the conversation
+        conversation_user: Optional sys_id of the user for the conversation
                            (defaults to the service account session user)
         conversation_label: Optional label for this conversation
-        context_memory: Optional JSON string of prior conversation for back-and-forth.
-                        Format: '{\"conversation\": [{\"from\": \"You\", \"message\": \"...\"},
-                                                     {\"from\": \"Agent\", \"message\": \"...\"}]}'
-        can_interact_with_user: Allow agent to ask clarifying questions (default: False
-                                for automated/non-interactive runs)
-        wait_for_completion: Poll the execution plan until agent finishes (default: True)
-        poll_timeout_seconds: Max seconds to wait for completion (default: 60, max: 300)
+        context_memory: Optional JSON for multi-turn conversations. Pass a JSON string
+                        representing the prior conversation history. Each new call starts
+                        a NEW execution plan — context_memory provides history, not resumption.
+                        Format: '{"conversation": [{"from": "You", "message": "..."},
+                                                   {"from": "Agent", "message": "..."}]}'
+                        Tip: Summarize the agent's prior response concisely. Include key
+                        data (sys_ids, results) so the new execution has full context.
+        can_interact_with_user: Allow agent to ask clarifying questions (default: False).
+                                Set to False for all automated/MCP invocations. When False,
+                                ALL inputs must be in the objective upfront.
+        wait_for_completion: Poll execution plan until agent finishes (default: True)
+        poll_timeout_seconds: Max seconds to wait (default: 60, max: 300)
 
     Returns:
         JSON with:
         - conversation_id: sys_id of the sn_aia_conversation record
         - execution_plan_id: sys_id of the sn_aia_execution_plan record
-        - status: Agent execution state (running / completed / error)
+        - status: Agent execution state (running / completed / failed)
         - agent_response: Final agent output once completed
-        - structured_output: Structured output if agent used structuredOutputRequest
-        - next_steps: How to continue the conversation or check status
+        - structured_output: Structured output if configured on the agent
+        - next_steps: Instructions if still running after timeout
+
+    If execution_plan_id is empty in the response, use:
+        query_execution_plans(minutes_ago=3) to find it by matching the objective,
+        then get_execution_details(execution_plan_id) to poll for completion.
 
     Examples:
-        # Simple invocation
-        run_ai_agent("IT Support Agent", "My laptop won't connect to WiFi")
+        # Simple invocation — objective must be fully self-contained
+        run_ai_agent(
+            "POV Prep Agent",
+            "Validate AI Search config sys_id abc123. Test these queries: "
+            "1) How do I reset my password 2) What is the VPN policy. "
+            "Report which queries return results and which fail."
+        )
 
         # With a context record
-        run_ai_agent("Incident Analyst", "Summarize and suggest a resolution",
+        run_ai_agent("Incident Analyst", "Analyze incident INC0001234 and suggest resolution steps.",
                      target_table="incident", target_record_id="abc123def456")
 
-        # Continue a conversation (pass prior history in context_memory)
-        run_ai_agent("Incident Analyst", "Looks good, go ahead with that plan",
-                     target_record_id="abc123def456",
-                     context_memory='{"conversation": [{"from": "You", "message": "Analyze INC001"},
-                                                       {"from": "Agent", "message": "I suggest..."}]}')
+        # Multi-turn — pass prior context so the agent has history
+        run_ai_agent(
+            "Incident Analyst",
+            "The plan looks good. Go ahead and apply the resolution steps you outlined.",
+            target_record_id="abc123def456",
+            context_memory='{"conversation": [{"from": "You", "message": "Analyze INC001"},
+                                              {"from": "Agent", "message": "Found memory issue. Suggest freeing 2GB."}]}'
+        )
 
-    Note:
-        Requires the service account to have permission to invoke AI agents. Check
-        background script execution rights. Uses AiAgentRuntimeUtil internally.
+    Required permissions:
+        Service account needs 'admin' or 'sn_aia.admin' role.
+        Roles that do NOT exist (do not reference them): script_processor, sn_aia.user
+        Real sn_aia roles: sn_aia.admin, sn_aia.viewer, sn_aia.integration, sn_aia.worker_manager
     """
     import time as _time
     client = get_client()
@@ -6859,10 +6881,15 @@ def run_ai_agent(
             "error": exec_result["error"],
             "agent": agent_name,
             "hint": (
-                "Could not reach the OOB AI Agent Invoker API. "
-                "Verify the Scripted REST API 'AI Agent Invoker API' "
-                "(/api/snc/ai_agent_invoker_api) is active on the instance "
-                "and the service account has permission to call it."
+                "Could not reach the OOB AI Agent Invoker API. Debugging steps: "
+                "1) HTTP 400 'URI does not represent any resource' → the full resource path "
+                "must be /api/snc/ai_agent_invoker_api/start_conversation (not just the base path). "
+                "2) HTTP 500 'AiAgentRuntimeUtil is not defined' → the Scripted REST API script "
+                "must use 'new sn_aia.AiAgentRuntimeUtil()' with the scope prefix. "
+                "3) Permissions → service account needs 'admin' or 'sn_aia.admin' role. "
+                "Roles that do NOT exist: script_processor, sn_aia.user. "
+                "4) Verify the API is active: snow_query(table='sys_ws_definition', "
+                "query='nameLIKEInvoker')"
             )
         }, indent=2)
 
