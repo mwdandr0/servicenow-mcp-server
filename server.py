@@ -6796,7 +6796,7 @@ def run_ai_agent(
                                                        {"from": "Agent", "message": "I suggest..."}]}')
 
     Note:
-        Requires the service account to have the 'sn_aia.user' role and
+        Requires the service account to have permission to invoke AI agents. Check
         background script execution rights. Uses AiAgentRuntimeUtil internally.
     """
     import time as _time
@@ -6862,7 +6862,7 @@ def run_ai_agent(
                 "Could not reach the OOB AI Agent Invoker API. "
                 "Verify the Scripted REST API 'AI Agent Invoker API' "
                 "(/api/snc/ai_agent_invoker_api) is active on the instance "
-                "and the service account has the 'sn_aia.user' role."
+                "and the service account has permission to call it."
             )
         }, indent=2)
 
