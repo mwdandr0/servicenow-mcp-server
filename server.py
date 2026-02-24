@@ -6844,10 +6844,12 @@ def run_ai_agent(
     if context_memory:
         payload["contextMemory"] = context_memory
 
-    # Step 3: Call the Scripted REST API endpoint
+    # Step 3: Call the OOB Scripted REST API
+    # ServiceNow ships "AI Agent Invoker API" (namespace: snc) out of the box
+    # Full path: POST /api/snc/ai_agent_invoker_api/start_conversation
     exec_result = client._request(
         "POST",
-        "/api/global/ai_agent_invoker/invoke",
+        "/api/snc/ai_agent_invoker_api/start_conversation",
         data=payload
     )
 
@@ -6857,13 +6859,10 @@ def run_ai_agent(
             "error": exec_result["error"],
             "agent": agent_name,
             "hint": (
-                "Could not reach the AI Agent Invoker API. "
-                "One-time setup required: in ServiceNow go to "
-                "System Web Services > Scripted REST APIs > New, "
-                "create a service with API ID 'ai_agent_invoker' in global scope, "
-                "add a POST resource at /invoke that calls "
-                "sn_aia.AiAgentRuntimeUtil().startAiAgentConversation(request.body.data). "
-                "Also ensure the service account has the 'sn_aia.user' role."
+                "Could not reach the OOB AI Agent Invoker API. "
+                "Verify the Scripted REST API 'AI Agent Invoker API' "
+                "(/api/snc/ai_agent_invoker_api) is active on the instance "
+                "and the service account has the 'sn_aia.user' role."
             )
         }, indent=2)
 
