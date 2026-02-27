@@ -3379,6 +3379,178 @@ def query_flow_reports(
 
 
 # ============================================================================
+# FLOW DESIGNER — INVOKE FLOWS & SUBFLOWS
+# ============================================================================
+
+@mcp.tool()
+def list_flows(
+    search: str = "",
+    flow_type: str = "both",
+    active_only: bool = True,
+    limit: int = 50
+) -> str:
+    """
+    List available Flow Designer flows and/or subflows on the instance.
+
+    Use this to discover what flows exist before triggering one, or to find
+    the sys_id / name of a specific flow.
+
+    Args:
+        search: Filter by name (partial match, case-insensitive) — default "" returns all
+        flow_type: "flow" for flows only, "subflow" for subflows only, "both" for all (default)
+        active_only: Only return active flows (default True)
+        limit: Max results per type (default 50)
+
+    Returns:
+        List of matching flows/subflows with name, sys_id, description, and type
+    """
+    client = get_client()
+    results = []
+
+    def query_table(table, label):
+        query = "active=true" if active_only else ""
+        if search:
+            name_filter = f"nameLIKE{search}"
+            query = f"{query}^{name_filter}" if query else name_filter
+        params = {
+            "sysparm_query": query,
+            "sysparm_fields": "sys_id,name,description,active,sys_updated_on",
+            "sysparm_limit": limit,
+            "sysparm_order_by": "name"
+        }
+        resp = client._request("GET", f"/api/now/table/{table}", params=params)
+        records = resp.get("result", [])
+        for r in records:
+            results.append(
+                f"[{label}] {r.get('name', 'Unnamed')}\n"
+                f"  sys_id: {r.get('sys_id', '')}\n"
+                f"  Active: {r.get('active', 'true')}\n"
+                f"  Updated: {r.get('sys_updated_on', 'N/A')}\n"
+                f"  Description: {(r.get('description') or 'No description')[:120]}"
+            )
+
+    if flow_type in ("flow", "both"):
+        query_table("sys_hub_flow", "FLOW")
+    if flow_type in ("subflow", "both"):
+        query_table("sys_hub_subflow", "SUBFLOW")
+
+    if not results:
+        return f"No {'active ' if active_only else ''}flows/subflows found matching '{search}'."
+    return f"Found {len(results)} result(s):\n\n" + "\n\n".join(results)
+
+
+@mcp.tool()
+def trigger_flow(
+    name_or_sys_id: str,
+    flow_type: str = "flow",
+    inputs: str = "{}",
+    wait_for_completion: bool = False
+) -> str:
+    """
+    Trigger a Flow Designer flow or subflow by name or sys_id.
+
+    If you provide a name (not a 32-character sys_id), the tool automatically
+    looks up the sys_id before invoking. Partial names are supported — if
+    multiple matches are found, all are listed so you can pick the right one.
+
+    Args:
+        name_or_sys_id: Flow/subflow name (e.g. "Onboard Employee") or sys_id (32-char hex)
+        flow_type: "flow" (default) or "subflow"
+        inputs: JSON string of input variables required by the flow (default "{}")
+                Example: '{"user_email": "john@example.com", "department": "IT"}'
+        wait_for_completion: Not yet supported by ServiceNow API — always async (default False)
+
+    Returns:
+        Execution context sys_id, status, and any output from the flow engine
+
+    Examples:
+        trigger_flow("Offboard Employee", "flow", '{"user_sys_id": "abc123"}')
+        trigger_flow("abc1234567890abcdef1234567890ab", "subflow", '{}')
+        trigger_flow("Send Notification Subflow", "subflow", '{"message": "Hello"}')
+    """
+    client = get_client()
+
+    # Determine if input is a sys_id (32 hex chars) or a name
+    import re
+    is_sys_id = bool(re.fullmatch(r'[a-f0-9]{32}', name_or_sys_id.strip(), re.IGNORECASE))
+
+    sys_id = name_or_sys_id.strip()
+
+    if not is_sys_id:
+        # Look up the sys_id by name
+        table = "sys_hub_flow" if flow_type == "flow" else "sys_hub_subflow"
+        params = {
+            "sysparm_query": f"nameLIKE{name_or_sys_id}",
+            "sysparm_fields": "sys_id,name,active",
+            "sysparm_limit": 10
+        }
+        resp = client._request("GET", f"/api/now/table/{table}", params=params)
+        matches = resp.get("result", [])
+
+        if not matches:
+            return (
+                f"No {flow_type} found matching '{name_or_sys_id}'.\n"
+                f"Use list_flows() to see available flows and subflows."
+            )
+        if len(matches) > 1:
+            options = "\n".join(
+                f"  - {m['name']} (sys_id: {m['sys_id']}, active: {m.get('active','?')})"
+                for m in matches
+            )
+            return (
+                f"Multiple {flow_type}s matched '{name_or_sys_id}'. Please re-run with the exact sys_id:\n\n"
+                f"{options}"
+            )
+
+        match = matches[0]
+        sys_id = match["sys_id"]
+        resolved_name = match["name"]
+    else:
+        resolved_name = name_or_sys_id
+
+    # Parse inputs
+    try:
+        import json as _json
+        input_data = _json.loads(inputs) if inputs.strip() else {}
+    except Exception:
+        return f"Invalid inputs JSON: {inputs}\nPlease provide a valid JSON object, e.g. '{{\"key\": \"value\"}}'."
+
+    # Build request body
+    body = {}
+    if input_data:
+        body["inputs"] = input_data
+
+    # Invoke the flow or subflow
+    endpoint_type = "flow" if flow_type == "flow" else "subflow"
+    endpoint = f"/api/sn_fd/{endpoint_type}/{sys_id}/run"
+
+    try:
+        result = client._request("POST", endpoint, data=body)
+    except Exception as e:
+        return f"Error triggering {flow_type} '{resolved_name}': {e}"
+
+    # Parse response
+    execution_id = result.get("executionId") or result.get("execution_id") or result.get("sys_id") or "unknown"
+    status = result.get("status") or "triggered"
+    output = result.get("outputs") or result.get("result") or {}
+
+    summary = (
+        f"✓ {flow_type.capitalize()} triggered successfully\n\n"
+        f"Name:         {resolved_name}\n"
+        f"sys_id:       {sys_id}\n"
+        f"Execution ID: {execution_id}\n"
+        f"Status:       {status}\n"
+    )
+    if output:
+        import json as _json
+        summary += f"\nOutputs:\n{_json.dumps(output, indent=2)}"
+    else:
+        summary += "\nNote: Flow Designer executes asynchronously. Check execution logs for final status."
+
+    return summary
+
+
+# ============================================================================
 # AI AGENT CONFIGURATION TOOLS
 # ============================================================================
 
