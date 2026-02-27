@@ -400,3 +400,58 @@ After tools are provisioned:
 ## Name Uniqueness Rule — Always Enforce
 
 Before presenting ANY name option, verify it does not appear in `existing_ai_agents.agent_names` from `discover_agent_build_context`. Generate a different name if any conflict exists. Never present a duplicate name to the user.
+
+---
+
+## Dashboard & Report Generation
+
+When a user asks to "report on", "dashboard", "visualize", "show me a summary of", "build a report", or says "make this pretty" / "turn this into HTML", generate a **single self-contained HTML file** using the style below.
+
+### When to Generate a Report
+
+| Trigger | Action |
+|---|---|
+| "Build a report on open changes" | Query the data → generate HTML |
+| "Show me a dashboard for P1 incidents" | Query with filters → generate HTML |
+| "Visualize this week's approvals" | Query `sysapproval_approver` → generate HTML |
+| "Make this pretty" / "format as HTML" | Reformat data already in conversation — **do NOT re-query** |
+
+### Visual Style — Always Use This
+
+- **Background**: `#0d1117` · Panels: `#161b24` · Borders: `rgba(255,255,255,0.08)`
+- **Priority colors**: Critical = `#f85149` · High = `#d97706` · Moderate = `#388bfd` · Low/Planning = `#6e7681`
+- **State colors**: Open/Active = `#388bfd` · Resolved = `#3fb950` · On Hold = `#d29922` · Closed = `#6e7681`
+- **Font**: `system-ui, -apple-system, sans-serif` for labels · `'SF Mono', 'Fira Code', monospace` for numbers and IDs
+- **No gradients, shadows, or decorative elements** — dense, data-forward, utilitarian
+
+### Charts — Always Load from CDN
+
+```html
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+```
+
+Chart types: area/line for time-series, doughnut for distribution, horizontal bar for assignee/group breakdown.
+
+### Standard Layout
+
+1. **Fixed top nav bar** — logo, clickable tab navigation (Dashboard / Data / Patterns / Metrics / Settings), live pulsing green dot, instance name + timestamp
+2. **Fixed left sidebar** — mirrors nav tabs with icons, highlights active tab
+3. **Search + filter chips** — keyword search bar, chip buttons for quick filters (All, Critical, High, New, On Hold, or relevant states)
+4. **Dashboard tab** — row of 4 metric tiles → severity/state count bar with stacked percentage bar → time-series area chart → 3 bottom panels (scrollable record list · assignee/group bar charts · cluster spotlight for related records)
+5. **Data tab** — full sortable table (click column header to sort), click any row to open a **detail modal** showing all fields
+6. **Patterns tab** — auto-detected clusters/anomalies (same app, same assignee, same time window, repeated errors)
+7. **Metrics tab** — doughnut + bar charts for priority, state, and assignee distribution
+8. **Settings tab** — instance info, data summary, toggle preferences
+9. **Detail modal** — all record fields formatted, closes on Escape or click outside
+
+### Supported Data Types
+
+Use identical layout and style for **any** ServiceNow data:
+- Incidents · Changes · Problems · Tasks
+- Approvals · Catalog Requests
+- AI Agent conversations · Knowledge Articles
+- Any custom table query
+
+### Output Rule
+
+Always produce a **single self-contained HTML file** — all CSS and JS inline, no external dependencies except Chart.js CDN. The file should be saveable and shareable on its own.
