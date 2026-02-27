@@ -264,3 +264,139 @@ Continue with standard workflow when:
 - Always confirm order details before submission
 - Report both the REQ and RITM numbers to the user
 - For VA-discovered AI Agents, use the sn_aia_execution_task lookup workaround
+
+---
+
+## AI Agent Building Workflow
+
+When a user wants to build a new AI Agent in ServiceNow, follow this conversational workflow. The experience is collaborative and conversational — ask questions, present options, and get approval at each key step before proceeding.
+
+### Step 1: Establish Context (4 Required Questions)
+
+Ask these questions before generating anything:
+
+1. **Guidance level**: How much detail do they want? High (explain every step), Medium (key checkpoints), or Low (essentials only)?
+2. **Deployment platform**: Virtual Agent / Teams / Slack (VA) or Now Assist Platform (NAP for multi-agent workflows)?
+3. **Primary purpose**: What should the agent do? (e.g., "IT support for password resets and access issues")
+4. **Target users**: Who interacts with it? (employees, customers, IT staff, managers, etc.)
+
+Also ask: **What team or group currently handles this work?** — needed for the discovery step.
+
+### Step 2: Environment Discovery
+
+Call `discover_agent_build_context` with the use case and optionally the assignment group:
+
+```
+discover_agent_build_context(
+  use_case="IT Support",
+  assignment_group="Desktop Support",
+  time_range_days=365
+)
+```
+
+Present findings to the user:
+- Total agents on the instance + domains already covered
+- Top work categories by volume and percentage
+- Ask: "Should the agent focus on [top categories], or all [use case] work?"
+
+**CRITICAL**: Store `existing_ai_agents.agent_names` — check every proposed name against this list.
+
+### Step 3: Generate Agent Name (3 Options, Uniqueness Required)
+
+Generate 3 name options following these rules:
+- Maximum 100 characters
+- NEVER suggest a name that matches any entry in `existing_ai_agents.agent_names`
+- Follow `name_patterns` from discovery (e.g., if agents use "...Agent" suffix, follow that)
+- Each option should reflect different naming approaches (descriptive, audience-focused, capability-focused)
+
+Present each with a brief rationale. Get user selection before proceeding.
+
+### Step 4: Generate Description (≤2000 characters — ALWAYS VALIDATE)
+
+**For VA agents**: Include natural language keywords from `nl_discovery_keywords` — these drive NL Discovery routing.
+**For NAP agents**: Describe capabilities and orchestration role.
+
+Present with explicit character count: `"**Description** (X of 2000 characters):"`
+
+If over 2000: optimize automatically and re-present. Never present over-limit content.
+Get approval before proceeding.
+
+### Step 5: Generate Role (≤2000 characters — ALWAYS VALIDATE)
+
+Define the agent's expertise, knowledge domain, operational approach, and constraints.
+Use `user_language_patterns` and `resolution_approaches` from discovery for authenticity.
+
+Present with character count. Validate, optimize if needed, get approval.
+
+### Step 6: Generate Agent Instructions (No character limit)
+
+Follow these prompt engineering standards:
+- **Token anchor** critical constraints at the top (character limits, required behaviors)
+- Use `workflow_steps` from discovery as the numbered workflow structure
+- Include **verification gates** after every major step — analytical report format, NEVER checkbox lists
+- Use action keywords consistently: analyze, evaluate, fetch, generate, verify
+- Incorporate `user_phrases` from discovery as sample user language examples
+- Include explicit tool usage instructions for each recommended tool
+- Include error handling and edge cases
+
+Present in a code block for easy copying. Get approval before creating.
+
+### Step 7: Get Explicit Approval Before Creating
+
+Summarize all four components and ask:
+"Are you ready for me to create this agent in ServiceNow? (Yes/No)"
+
+Do NOT call `create_ai_agent` until the user explicitly confirms.
+
+### Step 8: Create the Agent
+
+```
+create_ai_agent(
+  name="[Approved name]",
+  description="[Approved description]",
+  agent_role="[Approved role]",
+  agent_instructions="[Approved instructions]"
+)
+```
+
+Return the Agent Studio link to the user as a clickable URL immediately.
+
+### Step 9: Tool Provisioning
+
+Present the `tool_recommendations_detailed` from discovery:
+
+"Your agent needs tools to work. Based on [X] records analyzed, I recommend:
+1. **[Tool Type]**: [Why needed] — [Example usage]
+2. **[Tool Type]**: [Why needed] — [Example usage]
+..."
+
+For each tool, determine the best path:
+1. Call `list_agent_tools(tool_type="[type]")` to search for existing matches
+2. **Strong match found** → `clone_tool(source_sys_id, new_name, target_agent_sys_id=agent_sys_id)` — preferred
+3. **No match** → `create_tool()` + `add_tool_to_agent()`
+4. **Platform-native** (Knowledge Graph, Search, Web Search) → `add_tool_to_agent()` directly
+
+Report each result: "✅ [Tool name] attached" or "⚠️ [Tool name] needs manual configuration"
+
+### Post-Delivery
+
+After tools are provisioned:
+- Confirm agent Studio link is accessible
+- Provide 5 test queries from `user_phrases` discovery data
+- For VA deployments: remind to verify NL Discovery keywords in the description
+- Offer next steps: testing, deployment to Teams/Slack, building additional agents
+
+---
+
+## Character Limit Rules — Always Enforce
+
+| Field | Limit | If Exceeded |
+|---|---|---|
+| Agent Name | 100 chars | Shorten and re-present |
+| Description | 2000 chars | Optimize (remove non-essential), re-present |
+| Role | 2000 chars | Condense while preserving core expertise |
+| Instructions | No limit | No validation needed |
+
+## Name Uniqueness Rule — Always Enforce
+
+Before presenting ANY name option, verify it does not appear in `existing_ai_agents.agent_names` from `discover_agent_build_context`. Generate a different name if any conflict exists. Never present a duplicate name to the user.

@@ -3632,6 +3632,410 @@ def list_agent_tools(
     return "\n\n---\n\n".join(output)
 
 
+@mcp.tool()
+def discover_agent_build_context(
+    use_case: str,
+    assignment_group: str = "",
+    time_range_days: int = 365,
+    table_name: str = ""
+) -> str:
+    """
+    Comprehensive discovery for building AI Agents. Analyzes the ServiceNow instance
+    to provide actionable build intelligence: existing agents (for name uniqueness),
+    work patterns from actual ticket/record data, and tool recommendations.
+
+    Call this BEFORE create_ai_agent to:
+    - Get existing_ai_agents.agent_names to ensure the new name is unique
+    - Understand real work patterns and user language for prompt engineering
+    - Get tool_recommendations_detailed to guide tool provisioning strategy
+
+    Args:
+        use_case: Domain being analyzed (e.g., "IT Support", "HR Assistance",
+            "Customer Service", "Change Management", "Facilities Management")
+        assignment_group: Team name to filter work pattern analysis (e.g., "Desktop Support").
+            If not provided, analyzes all records.
+        time_range_days: Days to look back for work patterns (default 365)
+        table_name: Override auto-detected table (e.g., "incident", "sn_hr_core_case",
+            "change_request"). Auto-detected from use_case if not provided.
+
+    Returns:
+        JSON with existing_ai_agents, agent_builder_intelligence (including
+        tool_recommendations_detailed and prompt_suggestions), data_patterns,
+        and intelligence_summary
+    """
+    import json
+    from datetime import datetime, timedelta
+    from collections import Counter
+    import re
+
+    # Auto-detect table from use_case
+    if not table_name:
+        uc_lower = use_case.lower()
+        if any(kw in uc_lower for kw in ["it support", "incident", "helpdesk", "service desk", "desktop"]):
+            table_name = "incident"
+        elif any(kw in uc_lower for kw in ["hr", "human resource", "employee", "onboard"]):
+            table_name = "sn_hr_core_case"
+        elif any(kw in uc_lower for kw in ["customer service", "customer support", "csm"]):
+            table_name = "sn_customerservice_case"
+        elif any(kw in uc_lower for kw in ["change", "release management"]):
+            table_name = "change_request"
+        elif any(kw in uc_lower for kw in ["problem"]):
+            table_name = "problem"
+        elif any(kw in uc_lower for kw in ["facilities", "facility", "building"]):
+            table_name = "sm_order"
+        elif any(kw in uc_lower for kw in ["request", "catalog"]):
+            table_name = "sc_req_item"
+        else:
+            table_name = "incident"
+
+    errors = []
+
+    # ----------------------------------------------------------------
+    # 1. Existing AI Agents (name uniqueness + ecosystem awareness)
+    # ----------------------------------------------------------------
+    agents_response = requests.get(
+        f"{INSTANCE}/api/now/table/sn_aia_agent",
+        params={"sysparm_fields": "name,active,sys_id", "sysparm_limit": 500},
+        auth=(USERNAME, PASSWORD),
+        headers={"Accept": "application/json"}
+    )
+
+    agent_names = []
+    agents_by_use_case = []
+    name_patterns = []
+    total_agents = 0
+    active_agents = 0
+
+    if agents_response.status_code == 200:
+        agents = agents_response.json().get("result", [])
+        total_agents = len(agents)
+        active_agents = sum(1 for a in agents if str(a.get("active", "")).lower() == "true")
+
+        for a in agents:
+            agent_names.append({
+                "name": a.get("name", ""),
+                "active": str(a.get("active", "")).lower() == "true",
+                "sys_id": a.get("sys_id", "")
+            })
+
+        # Naming pattern analysis
+        all_words = []
+        for a in agents:
+            all_words.extend(a.get("name", "").lower().split())
+        word_counts = Counter(all_words)
+        suffix_kws = ["agent", "assistant", "bot", "helper", "advisor", "specialist", "support"]
+        found_suffixes = [f"{w} ({word_counts[w]} agents)" for w in suffix_kws if word_counts.get(w, 0) > 0]
+        if found_suffixes:
+            name_patterns = [{"pattern_type": "Common Suffixes", "patterns": found_suffixes}]
+
+        # Group agents by domain
+        domain_map = {
+            "it": "IT Support", "incident": "IT Support", "desk": "IT Support",
+            "hr": "HR Services", "employee": "HR Services",
+            "customer": "Customer Service",
+            "change": "Change Management",
+            "facility": "Facilities", "building": "Facilities",
+        }
+        by_domain = {}
+        for a in agents:
+            name_lower = a.get("name", "").lower()
+            domain = "Other"
+            for kw, d in domain_map.items():
+                if kw in name_lower:
+                    domain = d
+                    break
+            by_domain.setdefault(domain, []).append(a.get("name", ""))
+        agents_by_use_case = [
+            {"use_case": d, "count": len(names), "agent_names": names}
+            for d, names in by_domain.items()
+        ]
+    else:
+        errors.append(f"Could not retrieve existing agents: {agents_response.status_code}")
+
+    # ----------------------------------------------------------------
+    # 2. Work Patterns from target table
+    # ----------------------------------------------------------------
+    cutoff = (datetime.now() - timedelta(days=time_range_days)).strftime("%Y-%m-%d")
+    work_query = f"sys_created_on>={cutoff}"
+    if assignment_group:
+        work_query += f"^assignment_group.name={assignment_group}"
+
+    work_response = requests.get(
+        f"{INSTANCE}/api/now/table/{table_name}",
+        params={
+            "sysparm_query": work_query,
+            "sysparm_fields": "short_description,category,subcategory,state,close_code,close_notes,priority",
+            "sysparm_limit": 500
+        },
+        auth=(USERNAME, PASSWORD),
+        headers={"Accept": "application/json"}
+    )
+
+    ticket_samples = []
+    user_language = []
+    resolution_approaches = []
+    top_categories = []
+    state_dist = {}
+    record_count = 0
+
+    if work_response.status_code == 200:
+        records = work_response.json().get("result", [])
+        record_count = len(records)
+
+        ticket_samples = [
+            r.get("short_description", "").strip()
+            for r in records if r.get("short_description", "").strip()
+        ][:20]
+
+        stop_words = {
+            "the", "and", "for", "are", "not", "can", "has", "was", "had", "its",
+            "with", "this", "that", "from", "have", "been", "will", "about", "help",
+            "need", "please", "issue", "problem", "error", "when", "how", "why", "our"
+        }
+        all_kw = []
+        for r in records:
+            words = re.findall(r'\b[a-z]{3,}\b', r.get("short_description", "").lower())
+            all_kw.extend([w for w in words if w not in stop_words])
+        user_language = [{"item": w, "count": c} for w, c in Counter(all_kw).most_common(20)]
+
+        seen_notes = set()
+        for r in records:
+            notes = r.get("close_notes", "").strip()
+            if notes and len(notes) > 10 and notes not in seen_notes:
+                resolution_approaches.append(notes[:200])
+                seen_notes.add(notes)
+                if len(resolution_approaches) >= 8:
+                    break
+
+        cat_counter = Counter(
+            r.get("category", "").strip() for r in records if r.get("category", "").strip()
+        )
+        top_categories = [
+            {"category": cat, "count": cnt, "percentage": round(cnt / max(record_count, 1) * 100)}
+            for cat, cnt in cat_counter.most_common(10)
+        ]
+
+        state_counter = Counter(
+            r.get("state", "").strip() for r in records if r.get("state", "").strip()
+        )
+        state_dist = dict(state_counter.most_common(10))
+    else:
+        errors.append(f"Could not retrieve {table_name} records: {work_response.status_code}")
+
+    # ----------------------------------------------------------------
+    # 3. Tool Recommendations based on use case + table
+    # ----------------------------------------------------------------
+    uc_lower = use_case.lower()
+
+    fields_by_table = {
+        "incident": ["caller_id", "short_description", "description", "category",
+                     "subcategory", "priority", "state", "assignment_group",
+                     "assigned_to", "close_code", "close_notes"],
+        "change_request": ["short_description", "description", "category", "risk",
+                           "impact", "state", "assignment_group", "start_date", "end_date"],
+        "sn_hr_core_case": ["short_description", "description", "category", "state",
+                            "assignment_group", "opened_for"],
+        "problem": ["short_description", "description", "category", "impact",
+                    "state", "assignment_group"],
+    }
+    states_by_table = {
+        "incident": ["1=New", "2=In Progress", "3=On Hold", "6=Resolved", "7=Closed"],
+        "change_request": ["1=New", "-1=Assess", "-2=Authorize", "0=Implement", "3=Review", "4=Closed"],
+        "sn_hr_core_case": ["1=Open", "2=Work in Progress", "3=Closed Complete", "4=Closed Incomplete"],
+        "problem": ["1=New", "2=In Progress", "3=Resolved", "4=Closed"],
+    }
+    resolution_by_table = {
+        "incident": ["close_code", "close_notes"],
+        "change_request": ["close_code", "close_notes"],
+        "sn_hr_core_case": ["close_notes", "resolution_code"],
+        "problem": ["cause_notes", "fix_notes"],
+    }
+    search_by_table = {
+        "incident": ["short_description", "description", "close_notes"],
+        "change_request": ["short_description", "description"],
+        "sn_hr_core_case": ["short_description", "description"],
+        "problem": ["short_description", "description"],
+    }
+
+    tool_recommendations = [
+        {
+            "tool_type": "Record operation",
+            "why_needed": f"Read, create, and update {table_name} records",
+            "example_usage": "Fetch record details, create new records, update fields and state",
+            "fields_to_use": fields_by_table.get(table_name, ["short_description", "description", "state", "assignment_group"]),
+            "state_values": states_by_table.get(table_name, ["1=Open", "2=In Progress", "3=Closed"]),
+            "required_on_resolution": resolution_by_table.get(table_name, ["close_notes"])
+        },
+        {
+            "tool_type": "Knowledge graph",
+            "why_needed": "Search knowledge base articles to provide self-service answers",
+            "example_usage": "Look up KB articles for immediate answers before creating records",
+            "kb_usage_percentage": "Recommended for all agents to enable self-service deflection"
+        },
+        {
+            "tool_type": "Search retrieval",
+            "why_needed": "Search existing records for similar issues and proven solutions",
+            "example_usage": "Find similar past records for context and resolution guidance",
+            "search_fields": search_by_table.get(table_name, ["short_description", "description"])
+        }
+    ]
+
+    if any(kw in uc_lower for kw in ["it", "support", "incident", "helpdesk", "desktop"]):
+        tool_recommendations += [
+            {
+                "tool_type": "Script",
+                "why_needed": "Look up user details, check system access, retrieve CMDB information",
+                "example_usage": "Fetch caller record, check assignment group membership, look up affected CI",
+                "custom_fields": ["caller_id", "assignment_group", "cmdb_ci"]
+            },
+            {
+                "tool_type": "Flow action",
+                "why_needed": "Trigger automated IT workflows like password resets and access provisioning",
+                "example_usage": "Invoke ServiceNow flows for common repeatable IT tasks",
+                "workflows": ["Password Reset Flow", "Software Access Request", "VPN Access"]
+            }
+        ]
+    elif any(kw in uc_lower for kw in ["hr", "human", "employee", "onboard"]):
+        tool_recommendations += [
+            {
+                "tool_type": "Catalog items",
+                "why_needed": "Submit HR service requests through the service catalog",
+                "example_usage": "Help employees submit requests for leave, benefits, equipment",
+                "categories_to_cover": ["Benefits", "Leave Management", "Onboarding", "Off-boarding"]
+            },
+            {
+                "tool_type": "Flow action",
+                "why_needed": "Trigger HR workflows like onboarding tasks and approval chains",
+                "example_usage": "Start onboarding checklist, submit for manager approval",
+                "workflows": ["New Hire Onboarding", "Leave Approval", "Benefits Enrollment"]
+            }
+        ]
+    elif any(kw in uc_lower for kw in ["customer", "csm"]):
+        tool_recommendations += [
+            {
+                "tool_type": "Script",
+                "why_needed": "Look up customer account details, order history, and contact information",
+                "example_usage": "Fetch customer record, retrieve order status, check case history",
+                "custom_fields": ["account", "contact", "order_number"]
+            },
+            {
+                "tool_type": "Flow action",
+                "why_needed": "Trigger customer service workflows like escalations and refunds",
+                "example_usage": "Escalate to tier 2, initiate refund, schedule callback",
+                "workflows": ["Case Escalation", "Refund Processing", "Customer Callback"]
+            }
+        ]
+    else:
+        tool_recommendations.append({
+            "tool_type": "Script",
+            "why_needed": f"Custom data retrieval and processing for {use_case}",
+            "example_usage": "Fetch related records, calculate values, check conditions",
+            "custom_fields": []
+        })
+
+    # ----------------------------------------------------------------
+    # 4. Prompt suggestions
+    # ----------------------------------------------------------------
+    nl_keywords = [item["item"] for item in user_language[:10]]
+    user_phrases = ticket_samples[:8]
+
+    workflow_steps_map = {
+        "incident": [
+            "1. Greet user and identify the issue type",
+            "2. Gather user details (name, affected device/system)",
+            "3. Search knowledge base for self-service resolution",
+            "4. If KB found, present solution and confirm resolution",
+            "5. If unresolved, gather full details and create incident",
+            "6. Assign to appropriate team and set priority",
+            "7. Provide ticket number and expected resolution time"
+        ],
+        "sn_hr_core_case": [
+            "1. Identify employee and the HR service they need",
+            "2. Determine if it is a question (answer from KB) or a request (create case)",
+            "3. For requests: gather all required information",
+            "4. Submit the HR case or catalog request",
+            "5. Provide confirmation number and next steps"
+        ],
+        "change_request": [
+            "1. Understand the change being requested and its scope",
+            "2. Assess risk and impact level",
+            "3. Gather all required change details",
+            "4. Check for scheduling conflicts with other changes",
+            "5. Submit change request for approval workflow",
+            "6. Provide change number and approval status"
+        ],
+    }
+    workflow_steps = workflow_steps_map.get(table_name, [
+        "1. Understand the user's request",
+        "2. Gather required information",
+        "3. Search for relevant knowledge or existing records",
+        "4. Create or update records as needed",
+        "5. Confirm completion and provide reference number"
+    ])
+
+    # ----------------------------------------------------------------
+    # Build final result
+    # ----------------------------------------------------------------
+    primary_focus = top_categories[0]["category"] if top_categories else use_case
+
+    summary_parts = [
+        f"Discovery complete for '{use_case}' on {table_name} table.",
+        f"Instance has {total_agents} AI Agents ({active_agents} active) — check agent_names before naming.",
+        f"Analyzed {record_count} records over {time_range_days} days" +
+        (f" for group '{assignment_group}'" if assignment_group else "") + ".",
+    ]
+    if top_categories:
+        summary_parts.append(
+            f"Top category: {top_categories[0]['category']} ({top_categories[0]['percentage']}% of work)."
+        )
+    summary_parts.append(f"Generated {len(tool_recommendations)} tool recommendations.")
+    if errors:
+        summary_parts.append(f"Warnings: {'; '.join(errors)}")
+
+    result = {
+        "success": True,
+        "use_case": use_case,
+        "assignment_group": assignment_group or "All records",
+        "time_period": f"{time_range_days} days",
+        "table_analyzed": table_name,
+        "existing_ai_agents": {
+            "total_agents": total_agents,
+            "active_agents": active_agents,
+            "agent_names": agent_names,
+            "agents_by_use_case": agents_by_use_case,
+            "name_patterns": name_patterns
+        },
+        "agent_builder_intelligence": {
+            "ticket_content_samples": ticket_samples,
+            "user_language_patterns": user_language,
+            "resolution_approaches": resolution_approaches,
+            "tool_recommendations_detailed": tool_recommendations,
+            "scope_recommendations": {
+                "primary_focus": primary_focus,
+                "top_issues": [c["category"] for c in top_categories[:5]],
+                "suggested_agent_capabilities": [
+                    f"Handle '{c['category']}' requests ({c['percentage']}% of volume)"
+                    for c in top_categories[:5]
+                ] if top_categories else [f"Handle {use_case} requests"]
+            },
+            "prompt_suggestions": {
+                "nl_discovery_keywords": nl_keywords,
+                "user_phrases": user_phrases,
+                "resolution_patterns_for_prompt": resolution_approaches[:5],
+                "workflow_steps": workflow_steps
+            }
+        },
+        "data_patterns": {
+            "record_count": record_count,
+            "discovered_categories": top_categories,
+            "state_distribution": state_dist
+        },
+        "intelligence_summary": " ".join(summary_parts)
+    }
+
+    return json.dumps(result, indent=2)
+
+
 # ============================================================================
 # AI AGENT EXECUTION & TROUBLESHOOTING TOOLS
 # ============================================================================
@@ -5658,7 +6062,7 @@ def create_ai_agent(
     name: str,
     description: str,
     agent_role: str,
-    list_of_steps: str,
+    agent_instructions: str,
     active: bool = True,
     agent_type: str = "chat"
 ) -> str:
@@ -5670,10 +6074,12 @@ def create_ai_agent(
     for Cartesia Sonic-2 TTS compatibility.
 
     Args:
-        name: Name of the agent (e.g., "Custom Incident Resolver")
-        description: Brief description of what the agent does
-        agent_role: The agent's role/purpose (e.g., "Incident resolution specialist")
-        list_of_steps: Detailed step-by-step instructions for the agent
+        name: Name of the agent (e.g., "IT Support Agent"). Max 100 characters.
+        description: Description shown in agent list and used for NL Discovery in VA deployments.
+            For VA: include natural language keywords users say to trigger this agent. Max 2000 chars.
+        agent_role: The agent's expertise, knowledge domain, and operational approach. Max 2000 chars.
+        agent_instructions: Complete agent prompt with workflow logic, verification gates, tool usage
+            instructions, error handling, and success criteria. No character limit.
         active: Whether the agent is active (default True)
         agent_type: "chat" (default) or "voice"
 
@@ -5693,7 +6099,7 @@ def create_ai_agent(
         "name": name,
         "description": description,
         "role": agent_role,
-        "instructions": list_of_steps,
+        "instructions": agent_instructions,
         "active": str(active).lower()
     }
 
@@ -6628,7 +7034,7 @@ def clone_ai_agent(
     # Get the source agent
     source_url = f"{INSTANCE}/api/now/table/sn_aia_agent/{source_agent_sys_id}"
     params = {
-        "sysparm_fields": "name,description,agent_role,list_of_steps,active"
+        "sysparm_fields": "name,description,role,instructions,active"
     }
     
     source_response = requests.get(
@@ -6649,8 +7055,8 @@ def clone_ai_agent(
     payload = {
         "name": new_name,
         "description": new_description if new_description else source.get("description", ""),
-        "agent_role": source.get("agent_role", ""),
-        "list_of_steps": source.get("list_of_steps", ""),
+        "role": source.get("role", ""),
+        "instructions": source.get("instructions", ""),
         "active": source.get("active", "true")
     }
     
@@ -6734,6 +7140,128 @@ def clone_ai_agent(
         f"Tools Cloned: {tools_cloned}\n\n"
         f"The new agent has the same configuration and tools as the source."
     )
+
+
+@mcp.tool()
+def clone_tool(
+    source_tool_sys_id: str,
+    new_name: str,
+    new_description: str = "",
+    target_agent_sys_id: str = "",
+    max_automatic_executions: int = 5
+) -> str:
+    """
+    Clone an existing tool and optionally attach it to an AI agent.
+
+    Copies the tool record (name, type, script, configuration) with a new name
+    and description, then optionally creates the agent-tool M2M relationship.
+    Use for CLONE and CLONE_AND_ADAPT tool provisioning — reusing proven production
+    tools is faster and more reliable than building from scratch.
+
+    Args:
+        source_tool_sys_id: Sys ID of the tool to clone from sn_aia_tool
+        new_name: Name for the cloned tool (max 255 chars, include agent context)
+        new_description: Description for the cloned tool (uses source description if not provided)
+        target_agent_sys_id: If provided, attaches the cloned tool to this agent immediately
+        max_automatic_executions: Max auto executions for the agent attachment (default 5)
+
+    Returns:
+        Success message with cloned tool sys_id and optional M2M attachment details
+    """
+    # Get source tool details
+    source_response = requests.get(
+        f"{INSTANCE}/api/now/table/sn_aia_tool/{source_tool_sys_id}",
+        params={"sysparm_fields": "name,description,type,script,flow_action,active"},
+        auth=(USERNAME, PASSWORD),
+        headers={"Accept": "application/json"}
+    )
+
+    if source_response.status_code != 200:
+        return f"❌ Error retrieving source tool: {source_response.status_code} - {source_response.text}"
+
+    source = source_response.json().get("result", {})
+    if not source:
+        return f"❌ Source tool {source_tool_sys_id} not found."
+
+    source_name = source.get("name", "Unknown")
+
+    # Extract type value (may be a display/value object or plain string)
+    tool_type_raw = source.get("type", "")
+    tool_type = tool_type_raw.get("value", tool_type_raw) if isinstance(tool_type_raw, dict) else tool_type_raw
+
+    # Build clone payload
+    clone_payload = {
+        "name": new_name,
+        "description": new_description if new_description else source.get("description", ""),
+        "type": tool_type,
+        "active": str(source.get("active", "true")).lower()
+    }
+
+    # Copy type-specific fields
+    script = source.get("script", "")
+    if script:
+        clone_payload["script"] = script
+
+    flow_action = source.get("flow_action", {})
+    if flow_action:
+        fa_value = flow_action.get("value", "") if isinstance(flow_action, dict) else flow_action
+        if fa_value:
+            clone_payload["flow_action"] = fa_value
+
+    # Create the cloned tool record
+    create_response = requests.post(
+        f"{INSTANCE}/api/now/table/sn_aia_tool",
+        json=clone_payload,
+        auth=(USERNAME, PASSWORD),
+        headers={"Accept": "application/json", "Content-Type": "application/json"}
+    )
+
+    if create_response.status_code not in [200, 201]:
+        return f"❌ Error cloning tool: {create_response.status_code} - {create_response.text}"
+
+    new_tool = create_response.json().get("result", {})
+    new_tool_sys_id = new_tool.get("sys_id")
+
+    result_msg = (
+        f"✅ Tool cloned successfully!\n\n"
+        f"Source Tool: {source_name} ({source_tool_sys_id})\n"
+        f"New Tool: {new_name}\n"
+        f"New Tool Sys ID: {new_tool_sys_id}\n"
+        f"Type: {tool_type}"
+    )
+
+    # Optionally attach to agent
+    if target_agent_sys_id:
+        m2m_response = requests.post(
+            f"{INSTANCE}/api/now/table/sn_aia_agent_tool_m2m",
+            json={
+                "agent": target_agent_sys_id,
+                "tool": new_tool_sys_id,
+                "name": f"Agent Tool: {new_name}",
+                "max_automatic_executions": max_automatic_executions
+            },
+            auth=(USERNAME, PASSWORD),
+            headers={"Accept": "application/json", "Content-Type": "application/json"}
+        )
+
+        if m2m_response.status_code in [200, 201]:
+            m2m_id = m2m_response.json().get("result", {}).get("sys_id")
+            result_msg += (
+                f"\n\n✅ Tool attached to agent!\n"
+                f"Agent: {target_agent_sys_id}\n"
+                f"M2M Record: {m2m_id}\n"
+                f"Max Auto Executions: {max_automatic_executions}"
+            )
+        else:
+            result_msg += (
+                f"\n\n⚠️ Tool cloned but agent attachment failed: "
+                f"{m2m_response.status_code} - {m2m_response.text}\n"
+                f"Use add_tool_to_agent('{target_agent_sys_id}', '{new_tool_sys_id}') to attach manually."
+            )
+    else:
+        result_msg += f"\n\nNext step: Use add_tool_to_agent to attach this tool to an agent."
+
+    return result_msg
 
 
 @mcp.tool()
@@ -8504,371 +9032,10 @@ def cleanup_agent_configs(
     )
 
 
-# ============================================================================
-# FLOW DESIGNER DEBUGGING TOOLS
-# ============================================================================
-
-@mcp.tool()
-def query_flow_contexts(
-    flow_name: str = "",
-    state: str = "",
-    limit: int = 20,
-    order_by: str = "-sys_created_on"
-) -> str:
-    """
-    Query flow execution contexts to view workflow runs.
-
-    Flow contexts track the execution of ServiceNow workflows, including
-    their state, timing, inputs/outputs, and any errors encountered.
-
-    Args:
-        flow_name: Filter by flow name (partial match supported)
-        state: Filter by execution state:
-               - "finished" (completed successfully)
-               - "failed" (encountered error)
-               - "waiting" (paused for approval/input)
-               - "running" (currently executing)
-               - "cancelled" (manually stopped)
-        limit: Maximum records to return (default 20, max 1000)
-        order_by: Sort field (default: most recent first)
-
-    Returns:
-        JSON with flow execution contexts including:
-        - Flow name and current state
-        - Start/end timestamps
-        - Duration (if finished)
-        - Error messages (if failed)
-        - Input/output data
-        - Execution sys_id for detailed lookup
-
-    Example:
-        query_flow_contexts(flow_name="Incident Assignment", state="failed")
-    """
-    client = get_client()
-
-    query_parts = []
-    if flow_name:
-        query_parts.append(f"flow.nameLIKE{flow_name}")
-    if state:
-        query_parts.append(f"state={state}")
-
-    query = "^".join(query_parts) if query_parts else ""
-
-    result = client.table_get(
-        table="sys_flow_context",
-        query=query,
-        fields=[
-            "sys_id", "flow", "state", "started_at", "finished_at",
-            "error", "inputs", "outputs", "sys_created_on", "sys_updated_on"
-        ],
-        limit=min(limit, 1000),
-        order_by=order_by,
-        display_value="all"
-    )
-
-    if result["success"]:
-        contexts = result["data"].get("result", [])
-
-        # Enhance with calculated fields
-        for ctx in contexts:
-            if ctx.get("started_at") and ctx.get("finished_at"):
-                try:
-                    from datetime import datetime
-                    start = datetime.strptime(ctx["started_at"], "%Y-%m-%d %H:%M:%S")
-                    end = datetime.strptime(ctx["finished_at"], "%Y-%m-%d %H:%M:%S")
-                    duration = (end - start).total_seconds()
-                    ctx["duration_seconds"] = duration
-                except:
-                    pass
-
-        return json.dumps({
-            "count": len(contexts),
-            "flow_contexts": contexts,
-            "tip": "Use get_flow_context_details(sys_id) for detailed analysis"
-        }, indent=2)
-    else:
-        return json.dumps({"error": result["error"]}, indent=2)
-
-
-@mcp.tool()
-def query_flow_logs(
-    flow_context_sys_id: str = "",
-    log_level: str = "",
-    limit: int = 100,
-    order_by: str = "sys_created_on"
-) -> str:
-    """
-    Get detailed flow logs for debugging workflows.
-
-    Flow logs capture step-by-step execution details, errors, warnings,
-    and informational messages during workflow execution.
-
-    Args:
-        flow_context_sys_id: Filter by specific flow execution (sys_id from query_flow_contexts)
-        log_level: Filter by log level:
-                   - "error" (errors and failures)
-                   - "warn" (warnings)
-                   - "info" (informational messages)
-                   - "debug" (detailed debugging info)
-        limit: Maximum log entries to return (default 100, max 1000)
-        order_by: Sort order (default: chronological)
-
-    Returns:
-        JSON with flow log entries including:
-        - Log level and message
-        - Timestamp
-        - Flow context reference
-        - Step that generated the log
-        - Error details (if applicable)
-
-    Example:
-        query_flow_logs(flow_context_sys_id="abc123", log_level="error")
-    """
-    client = get_client()
-
-    query_parts = []
-    if flow_context_sys_id:
-        query_parts.append(f"flow_context={flow_context_sys_id}")
-    if log_level:
-        query_parts.append(f"level={log_level}")
-
-    query = "^".join(query_parts) if query_parts else ""
-
-    result = client.table_get(
-        table="sys_flow_log",
-        query=query,
-        fields=[
-            "sys_id", "level", "message", "flow_context", "step",
-            "sys_created_on", "details"
-        ],
-        limit=min(limit, 1000),
-        order_by=order_by,
-        display_value="all"
-    )
-
-    if result["success"]:
-        logs = result["data"].get("result", [])
-
-        # Group by level for summary
-        summary = {}
-        for log in logs:
-            level = log.get("level", "unknown")
-            summary[level] = summary.get(level, 0) + 1
-
-        return json.dumps({
-            "count": len(logs),
-            "summary_by_level": summary,
-            "logs": logs
-        }, indent=2)
-    else:
-        return json.dumps({"error": result["error"]}, indent=2)
-
-
-@mcp.tool()
-def get_flow_context_details(
-    flow_context_sys_id: str
-) -> str:
-    """
-    Get complete flow execution details with full context.
-
-    Provides comprehensive information about a specific flow execution,
-    including all related logs, inputs, outputs, and execution timeline.
-
-    Args:
-        flow_context_sys_id: The sys_id of the flow execution context
-                             (from query_flow_contexts)
-
-    Returns:
-        JSON with detailed flow execution data:
-        - Flow configuration and state
-        - Complete input/output data
-        - Execution timeline
-        - All related logs (errors, warnings, info)
-        - Performance metrics
-        - Troubleshooting recommendations (if failed)
-
-    Example:
-        get_flow_context_details("abc123def456")
-    """
-    client = get_client()
-
-    # Get flow context
-    context_result = client.table_get(
-        table="sys_flow_context",
-        sys_id=flow_context_sys_id,
-        display_value="all"
-    )
-
-    if not context_result["success"]:
-        return json.dumps({"error": context_result["error"]}, indent=2)
-
-    context = context_result["data"].get("result", {})
-
-    # Get related logs
-    logs_result = client.table_get(
-        table="sys_flow_log",
-        query=f"flow_context={flow_context_sys_id}",
-        fields=["level", "message", "sys_created_on", "details"],
-        limit=100,
-        order_by="sys_created_on",
-        display_value="all"
-    )
-
-    logs = logs_result["data"].get("result", []) if logs_result["success"] else []
-
-    # Calculate metrics
-    metrics = {
-        "total_logs": len(logs),
-        "errors": len([l for l in logs if l.get("level") == "error"]),
-        "warnings": len([l for l in logs if l.get("level") == "warn"])
-    }
-
-    # Add duration if available
-    if context.get("started_at") and context.get("finished_at"):
-        try:
-            from datetime import datetime
-            start = datetime.strptime(context["started_at"], "%Y-%m-%d %H:%M:%S")
-            end = datetime.strptime(context["finished_at"], "%Y-%m-%d %H:%M:%S")
-            metrics["duration_seconds"] = (end - start).total_seconds()
-        except:
-            pass
-
-    # Generate troubleshooting tips for failed flows
-    troubleshooting = []
-    if context.get("state") == "failed":
-        troubleshooting.append("🔍 Flow failed - check error logs below")
-        if metrics["errors"] > 0:
-            troubleshooting.append(f"Found {metrics['errors']} error(s) in logs")
-        if context.get("error"):
-            troubleshooting.append(f"Error message: {context.get('error')}")
-
-    return json.dumps({
-        "flow_context": context,
-        "metrics": metrics,
-        "logs": logs,
-        "troubleshooting": troubleshooting if troubleshooting else ["Flow executed successfully"]
-    }, indent=2)
-
-
-@mcp.tool()
-def query_flow_reports(
-    flow_name: str = "",
-    days_back: int = 7,
-    group_by_state: bool = True
-) -> str:
-    """
-    Generate performance reports from flow executions.
-
-    Analyzes recent flow executions to provide success rates, failure analysis,
-    and performance metrics for workflow monitoring and optimization.
-
-    Args:
-        flow_name: Filter by specific flow (optional, analyzes all if empty)
-        days_back: Number of days to analyze (default 7, max 90)
-        group_by_state: Group results by execution state (default True)
-
-    Returns:
-        JSON with flow performance analysis:
-        - Total executions by state
-        - Success rate percentage
-        - Average execution time
-        - Failed execution details
-        - Performance trends
-        - Recommendations for optimization
-
-    Example:
-        query_flow_reports(flow_name="Incident Assignment", days_back=30)
-    """
-    client = get_client()
-
-    # Build query for recent executions
-    query_parts = []
-    if flow_name:
-        query_parts.append(f"flow.nameLIKE{flow_name}")
-
-    # Add date filter
-    from datetime import datetime, timedelta
-    days_back = min(days_back, 90)  # Cap at 90 days
-    cutoff_date = datetime.now() - timedelta(days=days_back)
-    query_parts.append(f"sys_created_on>={cutoff_date.strftime('%Y-%m-%d')}")
-
-    query = "^".join(query_parts)
-
-    # Query flow contexts
-    result = client.table_get(
-        table="sys_flow_context",
-        query=query,
-        fields=["sys_id", "flow", "state", "started_at", "finished_at", "error"],
-        limit=1000,
-        order_by="-sys_created_on",
-        display_value="all"
-    )
-
-    if not result["success"]:
-        return json.dumps({"error": result["error"]}, indent=2)
-
-    contexts = result["data"].get("result", [])
-
-    # Analyze results
-    total = len(contexts)
-    by_state = {}
-    durations = []
-    failed_flows = []
-
-    for ctx in contexts:
-        state = ctx.get("state", "unknown")
-        by_state[state] = by_state.get(state, 0) + 1
-
-        # Calculate duration
-        if ctx.get("started_at") and ctx.get("finished_at"):
-            try:
-                start = datetime.strptime(ctx["started_at"], "%Y-%m-%d %H:%M:%S")
-                end = datetime.strptime(ctx["finished_at"], "%Y-%m-%d %H:%M:%S")
-                duration = (end - start).total_seconds()
-                durations.append(duration)
-            except:
-                pass
-
-        # Track failures
-        if state == "failed":
-            failed_flows.append({
-                "sys_id": ctx.get("sys_id"),
-                "flow": ctx.get("flow"),
-                "error": ctx.get("error"),
-                "timestamp": ctx.get("started_at")
-            })
-
-    # Calculate metrics
-    finished = by_state.get("finished", 0)
-    failed = by_state.get("failed", 0)
-    success_rate = (finished / total * 100) if total > 0 else 0
-    avg_duration = sum(durations) / len(durations) if durations else 0
-
-    # Generate recommendations
-    recommendations = []
-    if success_rate < 80:
-        recommendations.append("⚠️ Success rate below 80% - review failed executions")
-    if avg_duration > 60:
-        recommendations.append("🐌 Average execution time > 60s - consider optimization")
-    if failed > 0:
-        recommendations.append(f"🔍 Review {failed} failed execution(s) for recurring issues")
-    if not recommendations:
-        recommendations.append("✅ Flow performance looks healthy")
-
-    return json.dumps({
-        "analysis_period": f"Last {days_back} days",
-        "flow_name": flow_name if flow_name else "All flows",
-        "total_executions": total,
-        "success_rate": f"{success_rate:.1f}%",
-        "executions_by_state": by_state,
-        "avg_duration_seconds": f"{avg_duration:.2f}",
-        "failed_executions": failed_flows[:10],  # Top 10 failures
-        "recommendations": recommendations
-    }, indent=2)
 
 
 # ============================================================================
-# APP & PLUGIN MANAGEMENT TOOLS
+# APP STORE, PLUGINS & SCRIPTING
 # ============================================================================
 
 @mcp.tool()
@@ -8932,7 +9099,6 @@ def snow_app_info(
     else:
         return json.dumps({"error": result["error"]}, indent=2)
 
-
 @mcp.tool()
 def snow_app_install(
     app_id: str,
@@ -8966,7 +9132,6 @@ def snow_app_install(
     """
     client = get_client()
 
-    # Create installation request
     data = {
         "app_id": app_id,
         "version": version,
@@ -8974,8 +9139,6 @@ def snow_app_install(
         "state": "requested"
     }
 
-    # Note: Actual installation uses sys_app_install table or REST API endpoint
-    # This is a simplified implementation - actual endpoint may vary
     result = client.table_create("sys_app_install", data)
 
     if result["success"]:
@@ -8993,7 +9156,6 @@ def snow_app_install(
             "error": result["error"],
             "hint": "Check app_id and ensure you have installation permissions"
         }, indent=2)
-
 
 @mcp.tool()
 def snow_app_install_status(
@@ -9032,7 +9194,6 @@ def snow_app_install_status(
 
     install_record = result["data"].get("result", {})
 
-    # Determine status message
     state = install_record.get("state", "unknown")
     status_messages = {
         "requested": "⏳ Installation queued",
@@ -9051,7 +9212,6 @@ def snow_app_install_status(
         "details": install_record,
         "next_steps": "Installation complete" if state == "complete" else "Check back in a few minutes"
     }, indent=2)
-
 
 @mcp.tool()
 def snow_plugin_activate(
@@ -9083,7 +9243,6 @@ def snow_plugin_activate(
     """
     client = get_client()
 
-    # Get plugin info first
     plugin_result = client.table_get(
         table="v_plugin",
         query=f"id={plugin_id}",
@@ -9112,9 +9271,6 @@ def snow_plugin_activate(
             "active": current_state
         }, indent=2)
 
-    # Activate/deactivate plugin
-    # Note: Actual activation uses sys_plugins or REST API endpoint
-    # This is a simplified implementation
     action = "activate" if activate else "deactivate"
 
     return json.dumps({
@@ -9125,7 +9281,6 @@ def snow_plugin_activate(
         "active": activate,
         "note": "Plugin activation may take a few moments to complete"
     }, indent=2)
-
 
 @mcp.tool()
 def snow_run_script(
@@ -9162,11 +9317,7 @@ def snow_run_script(
     """
     client = get_client()
 
-    # Execute via sys_script_execution or background script execution
-    # Note: This requires special permissions and may not be available in all instances
     try:
-        # Attempt to execute via REST API script endpoint
-        # Actual implementation depends on instance configuration
         result = client._request(
             "POST",
             "/api/now/script/execute",
@@ -9199,137 +9350,6 @@ def snow_run_script(
             "note": "Script execution endpoint may not be available in your instance",
             "alternative": "Consider using Background Scripts in ServiceNow UI for script execution"
         }, indent=2)
-
-
-# ============================================================================
-# SYSTEM LOGGING & TROUBLESHOOTING
-# ============================================================================
-
-@mcp.tool()
-def query_syslog(
-    level: str = "",
-    source: str = "",
-    message_filter: str = "",
-    days_back: int = 1,
-    limit: int = 100
-) -> str:
-    """
-    Query ServiceNow system logs for error investigation and troubleshooting.
-
-    Access system-level logs to diagnose platform issues, errors, warnings,
-    and other system events. Useful for troubleshooting integration failures,
-    background job errors, and system performance issues.
-
-    Args:
-        level: Filter by log level:
-               - "error" (errors and failures)
-               - "warn" (warnings)
-               - "info" (informational messages)
-               - "debug" (debugging information)
-        source: Filter by log source (e.g., "IntegrationLog", "ScheduledJob")
-        message_filter: Search for specific text in log messages
-        days_back: Number of days to search (default 1, max 7)
-        limit: Maximum log entries to return (default 100, max 500)
-
-    Returns:
-        JSON with system log entries including:
-        - Log level and severity
-        - Source/origin of the log
-        - Message and details
-        - Timestamp
-        - Related record references
-        - Error stack traces (if applicable)
-
-    Example:
-        query_syslog(level="error", days_back=1)
-        query_syslog(source="IntegrationLog", message_filter="REST API")
-
-    Use Cases:
-        - Debug integration failures
-        - Troubleshoot scheduled job errors
-        - Investigate system performance issues
-        - Monitor platform health
-        - Track error patterns
-    """
-    client = get_client()
-
-    # Build query
-    query_parts = []
-
-    if level:
-        query_parts.append(f"level={level}")
-
-    if source:
-        query_parts.append(f"sourceLIKE{source}")
-
-    if message_filter:
-        query_parts.append(f"messageLIKE{message_filter}")
-
-    # Add date filter
-    from datetime import datetime, timedelta
-    days_back = min(days_back, 7)  # Cap at 7 days for performance
-    cutoff_date = datetime.now() - timedelta(days=days_back)
-    query_parts.append(f"sys_created_on>={cutoff_date.strftime('%Y-%m-%d')}")
-
-    query = "^".join(query_parts)
-
-    # Query syslog table
-    result = client.table_get(
-        table="syslog",
-        query=query,
-        fields=[
-            "sys_id", "level", "source", "message", "sys_created_on",
-            "sys_created_by", "document", "transaction_id"
-        ],
-        limit=min(limit, 500),
-        order_by="-sys_created_on",
-        display_value="all"
-    )
-
-    if not result["success"]:
-        return json.dumps({"error": result["error"]}, indent=2)
-
-    logs = result["data"].get("result", [])
-
-    # Analyze logs
-    summary = {
-        "total_entries": len(logs),
-        "by_level": {},
-        "by_source": {},
-        "time_range": f"Last {days_back} day(s)"
-    }
-
-    for log in logs:
-        # Count by level
-        log_level = log.get("level", "unknown")
-        summary["by_level"][log_level] = summary["by_level"].get(log_level, 0) + 1
-
-        # Count by source
-        log_source = log.get("source", "unknown")
-        summary["by_source"][log_source] = summary["by_source"].get(log_source, 0) + 1
-
-    # Generate insights
-    insights = []
-    if summary["by_level"].get("error", 0) > 10:
-        insights.append(f"⚠️ High error count: {summary['by_level']['error']} errors found")
-    if summary["by_level"].get("warn", 0) > 20:
-        insights.append(f"⚠️ High warning count: {summary['by_level']['warn']} warnings found")
-    if len(logs) >= limit:
-        insights.append(f"📊 Result limit reached ({limit}). Consider narrowing your search.")
-    if not logs:
-        insights.append("✅ No logs found matching criteria - system appears healthy")
-
-    return json.dumps({
-        "summary": summary,
-        "insights": insights if insights else ["System logs retrieved successfully"],
-        "logs": logs,
-        "tips": [
-            "Use level='error' to focus on critical issues",
-            "Combine source and message_filter for specific troubleshooting",
-            "Check transaction_id to correlate related log entries"
-        ]
-    }, indent=2)
-
 
 # =============================================================================
 # MCP RESOURCES (Expose ServiceNow data as context)
