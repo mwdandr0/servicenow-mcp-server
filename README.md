@@ -1,6 +1,6 @@
 # ServiceNow MCP Server with AI Agent Builder
 
-A comprehensive Model Context Protocol (MCP) server for interacting with ServiceNow instances, including full support for building and managing AI Agents, debugging workflows, and troubleshooting ServiceNow integrations using the REST API with basic authentication.
+A comprehensive Model Context Protocol (MCP) server for interacting with ServiceNow instances — 81+ tools covering AI Agent building, ITSM, change management, service catalog, pre-flight validation, and more. Supports basic auth, API key, and OAuth.
 
 ## Setup Instructions
 
@@ -13,9 +13,20 @@ cp .env.template .env
 ```
 
 Then edit `.env` with your actual credentials:
-- `SERVICENOW_INSTANCE`: Your ServiceNow instance name (e.g., 'dev12345' or 'dev12345.service-now.com')
+Three auth methods supported — use whichever your instance requires:
+
+**Basic auth (most common):**
+- `SERVICENOW_INSTANCE`: Your ServiceNow instance (e.g., `dev12345` or `dev12345.service-now.com`)
 - `SERVICENOW_USERNAME`: Your ServiceNow username
 - `SERVICENOW_PASSWORD`: Your ServiceNow password
+
+**API key** (takes priority over basic auth if set):
+- `SERVICENOW_API_KEY`: Your ServiceNow API key
+
+**OAuth bearer token:**
+- `SERVICENOW_OAUTH_TOKEN`: Your OAuth access token
+
+You can also use `SNOW_` prefixes (e.g., `SNOW_INSTANCE`, `SNOW_API_KEY`) interchangeably.
 
 ### 2. Dependencies
 
@@ -127,7 +138,18 @@ Essential tools for instance administration and debugging:
 
 **See [ERROR_HANDLING_STANDARD.md](ERROR_HANDLING_STANDARD.md) for standardized error response format**
 
-### 🎫 **ITSM Core Tools (NEW!)**
+### 🔄 **Change Management**
+End-to-end change request workflows:
+- `create_change_request` - Create standard, normal, or emergency change requests
+- `update_change_request` - Update fields on existing changes
+- `list_change_requests` - List and filter by state, type, or assignment group
+- `get_change_request_details` - Full details including tasks and approval records
+- `add_task_to_change` - Add implementation tasks to a change
+- `submit_change_for_approval` - Move change to Assess state (triggers CAB workflow)
+- `approve_change_request` - Approve all pending approval records for a change
+- `reject_change_request` - Reject with mandatory reason
+
+### 🎫 **ITSM Core Tools**
 Purpose-built tools for incident, attachment, and approval management:
 
 **Incident Management:**
@@ -185,8 +207,21 @@ See **[AI_AGENT_GUIDE.md](AI_AGENT_GUIDE.md)** for a complete guide on building 
 - Best practices
 - Example use cases
 
+## 🎭 Role-Based Tool Packages
+
+Use the `list_tool_packages` tool to see which tools belong to each role, or set `SNOW_TOOL_PACKAGE` in your env to tell Claude which package to focus on:
+
+| Package | Best For |
+|---|---|
+| `service_desk` | Incident management, approvals, catalog ordering |
+| `change_coordinator` | Change management end-to-end |
+| `catalog_manager` | Catalog browsing, ordering, approvals |
+| `ai_admin` | AI Agent building, debugging, performance analysis |
+| `platform_developer` | Generic table ops, scripted REST, system tools |
+| `full_access` | All 81+ tools (default) |
+
 ## Security Notes
 
 - Never commit your `.env` file to version control
 - Use service accounts with appropriate permissions
-- Consider using OAuth instead of basic auth for production use
+- API key or OAuth is recommended over basic auth for production

@@ -16,11 +16,17 @@ A comprehensive Model Context Protocol (MCP) server for ServiceNow, enabling Cla
 - Track performance trends over time
 - Identify bottlenecks across 13+ ServiceNow tables
 
-### 🎫 ITSM Operations (13 tools)
+### 🎫 ITSM Operations (21 tools)
 **Incident Management:**
 - Create, update, resolve incidents with auto-lookup
 - Pre-built filters (critical, unassigned, breached SLA)
 - Rich detail retrieval with work history
+
+**Change Management:**
+- Create standard, normal, and emergency change requests
+- List and filter changes by state, type, or group
+- Add tasks to changes, get full details including tasks and approvals
+- Submit for approval, approve, or reject with comments
 
 **Attachment Management:**
 - Upload/download attachments (optimized for small files <5 KB)
@@ -54,7 +60,7 @@ A comprehensive Model Context Protocol (MCP) server for ServiceNow, enabling Cla
 - Flow Designer debugging
 - System log queries
 
-**Total: 73+ tools** covering the complete ServiceNow platform
+**Total: 81+ tools** covering the complete ServiceNow platform
 
 ---
 
@@ -62,7 +68,7 @@ A comprehensive Model Context Protocol (MCP) server for ServiceNow, enabling Cla
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/servicenow-mcp-server.git
+git clone https://github.com/mwdandr0/servicenow-mcp-server.git
 cd servicenow-mcp-server
 ```
 
@@ -76,11 +82,21 @@ pip install mcp requests python-dotenv
 cp .env.template .env
 ```
 
-Edit `.env` with your ServiceNow credentials:
+Edit `.env` with your ServiceNow credentials. Three auth methods are supported — use whichever your instance requires:
+
 ```env
+# Option 1: Basic auth (most common)
 SERVICENOW_INSTANCE=dev12345.service-now.com
 SERVICENOW_USERNAME=your_username
 SERVICENOW_PASSWORD=your_password
+
+# Option 2: API key (SERVICENOW_API_KEY takes priority over basic auth)
+SERVICENOW_INSTANCE=dev12345.service-now.com
+SERVICENOW_API_KEY=your_api_key
+
+# Option 3: OAuth bearer token
+SERVICENOW_INSTANCE=dev12345.service-now.com
+SERVICENOW_OAUTH_TOKEN=your_oauth_token
 ```
 
 ### 4. Test the Server
@@ -258,14 +274,16 @@ Contributions welcome! Please:
 - ✅ AI Agent building and debugging (50+ tools)
 - ✅ Performance analysis (conversation bottlenecks)
 - ✅ ITSM operations (incidents, attachments, approvals)
+- ✅ Change management (create, update, approve, reject, tasks)
 - ✅ Pre-flight validation (mandatory field discovery)
 - ✅ Service catalog ordering
 - ✅ Platform utilities
+- ✅ Multi-auth support (basic, API key, OAuth bearer token)
+- ✅ Role-based tool packages (service_desk, change_coordinator, ai_admin, and more)
 
 ### Future Enhancements
 - ⏳ CMDB operations (CI management, relationships)
-- ⏳ Change management workflows
-- ⏳ Knowledge base operations
+- ⏳ Knowledge base full CRUD (create, publish, manage articles)
 - ⏳ SLA and metric queries
 - ⏳ Batch operations
 - ⏳ Advanced Flow Designer debugging
@@ -289,8 +307,7 @@ MIT License - See [LICENSE](LICENSE) file for details
 
 ## 📞 Support
 
-- **Issues:** [GitHub Issues](https://github.com/YOUR_USERNAME/servicenow-mcp-server/issues)
-- **Documentation:** See `/docs` folder
+- **Issues:** [GitHub Issues](https://github.com/mwdandr0/servicenow-mcp-server/issues)
 - **ServiceNow Docs:** [ServiceNow REST API Reference](https://docs.servicenow.com/bundle/latest/page/integrate/inbound-rest/concept/c_RESTAPI.html)
 
 ---
