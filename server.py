@@ -33,20 +33,33 @@ class ServiceNowClient:
             self.base_url = f"https://{instance}"
 
         self.session = requests.Session()
-        self.session.auth = (username, password)
+
+        # Multi-auth: API key > OAuth bearer > basic auth
+        api_key = os.getenv("SERVICENOW_API_KEY") or os.getenv("SNOW_API_KEY")
+        oauth_token = os.getenv("SERVICENOW_OAUTH_TOKEN") or os.getenv("SNOW_OAUTH_TOKEN")
+        if api_key:
+            self.session.headers["X-sn-apikey"] = api_key
+            self.auth_method = "api_key"
+        elif oauth_token:
+            self.session.headers["Authorization"] = f"Bearer {oauth_token}"
+            self.auth_method = "oauth"
+        else:
+            self.session.auth = (username, password)
+            self.auth_method = "basic"
+
         self.session.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json"
         })
         self.timeout = 30
 
-    def _request(self, method: str, endpoint: str, params: dict = None, data: dict = None) -> dict:
+    def _request(self, method: str, endpoint: str, params: dict = None, data: dict = None, timeout: int = None) -> dict:
         """Make HTTP request to ServiceNow."""
         url = f"{self.base_url}{endpoint}"
         try:
             response = self.session.request(
                 method=method, url=url, params=params,
-                json=data, timeout=self.timeout
+                json=data, timeout=timeout or self.timeout
             )
             result = {
                 "success": response.ok,
@@ -7450,6 +7463,13 @@ def run_ai_agent(
     poll_timeout_seconds: int = 60
 ) -> str:
     """
+    ⚠️  AUTONOMOUS BACKGROUND TASKS ONLY — DO NOT use this for interactive conversations.
+
+    If the user wants to TALK TO or INTERACT WITH an AI Agent (e.g. "run the agent",
+    "start the agent", "let's use the AI Agent Builder"), use converse_with_ai_agent()
+    instead. This tool is ONLY for fire-and-forget background tasks where no back-and-forth
+    with the user is needed.
+
     Invoke a ServiceNow AI Agent via the OOB AI Agent Invoker API.
 
     Calls POST /api/snc/ai_agent_invoker_api/start_conversation which wraps
@@ -7669,6 +7689,408 @@ def run_ai_agent(
         )
 
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def list_available_agents(
+    search: str = "",
+    limit: int = 20
+) -> str:
+    """
+    List ServiceNow AI Agents available on the instance (sn_aia_agent table).
+
+    Use this to discover agents and find their sys_id before calling
+    converse_with_ai_agent(). Returns name, description, proficiency, and sys_id.
+
+    Args:
+        search: Optional partial name filter (e.g. "incident" to find incident-related agents)
+        limit:  Maximum number of agents to return (default 20)
+
+    Returns:
+        JSON with a list of agents including sys_id, name, description, proficiency.
+
+    Examples:
+        list_available_agents()
+        list_available_agents(search="Support")
+    """
+    client = get_client()
+
+    query = f"nameLIKE{search}" if search else ""
+    result = client.table_get(
+        table="sn_aia_agent",
+        query=query,
+        fields=["sys_id", "name", "description", "proficiency"],
+        limit=limit
+    )
+
+    if not result["success"]:
+        return json.dumps({"success": False, "error": result.get("error", "Query failed")}, indent=2)
+
+    agents = result["data"].get("result", [])
+    return json.dumps({
+        "success": True,
+        "count": len(agents),
+        "agents": agents,
+        "hint": "Use sys_id with converse_with_ai_agent() to start a conversation."
+    }, indent=2)
+
+
+@mcp.tool()
+def converse_with_ai_agent(
+    agent_id: str,
+    message: str,
+    session_id: str = "",
+    execution_plan_id: str = "",
+    poll_timeout_seconds: int = 90
+) -> str:
+    """
+    ✅  USE THIS to talk to or interact with a ServiceNow AI Agent.
+
+    This is the correct tool whenever the user says "run the agent", "start the agent",
+    "use the AI Agent Builder", "talk to an agent", or similar. It supports multi-turn
+    conversations where the agent asks clarifying questions and you relay the user's answers.
+
+    Have an interactive, multi-turn conversation with a ServiceNow AI Agent.
+
+    Uses the OOB platform API:
+      POST /api/sn_aia/agenticai/v1/agent/id/{agent_id}
+
+    Unlike run_ai_agent (autonomous background tasks only), this tool supports interactive
+    conversations where the agent asks the user clarifying questions via Input Collector controls.
+
+    Session continuity: pass session_id AND execution_plan_id from the previous
+    call on every subsequent turn. Both are returned in the result.
+
+    Args:
+        agent_id:             sys_id of the agent (use list_available_agents() to find)
+        message:              Your message or answer to the agent's last question
+        session_id:           Session ID from the previous call (omit on first message)
+        execution_plan_id:    Execution plan ID from the previous call (omit on first message).
+                              Required for multi-turn to detect new responses correctly.
+        poll_timeout_seconds: Max seconds to wait for the agent's response (default 90)
+
+    Returns:
+        JSON with:
+        - session_id:        Pass back on the next call
+        - execution_plan_id: Pass back on the next call
+        - agent_response:    The agent's reply (text + choices if Input Collector)
+        - status:            "responded" | "no_response" | "error"
+
+    Workflow:
+        1. list_available_agents() → find agent sys_id
+        2. result = converse_with_ai_agent(agent_id, "I want to build an ITSM agent")
+           → save result["session_id"] and result["execution_plan_id"]
+        3. result = converse_with_ai_agent(agent_id, "High Guidance",
+                        session_id=..., execution_plan_id=...)
+        4. Repeat until agent indicates it is done
+
+    Required: sn_aia.admin or admin role; sn_aia.external_agents_enabled=true on instance.
+    """
+    import time as _time
+    import uuid as _uuid
+
+    client = get_client()
+
+    # Capture the sys_created_on of the newest agent message BEFORE posting.
+    # Used to filter for strictly newer messages after POST — more reliable than
+    # count-based diffing (user message also increments total count).
+    exec_plan_id = execution_plan_id or ""
+    baseline_timestamp = ""
+    if exec_plan_id:
+        baseline_timestamp = _get_agent_baseline(client, exec_plan_id)
+
+    # Snapshot the most recently created execution plan BEFORE posting.
+    # _discover_exec_plan uses this to only accept a plan created AFTER our POST,
+    # avoiding stale plans from previous sessions.
+    prior_plan_id = ""
+    if not exec_plan_id:
+        snap = client.table_get(
+            table="sn_aia_execution_plan",
+            fields=["sys_id"],
+            limit=1,
+            order_by="-sys_created_on"
+        )
+        if snap.get("success"):
+            plans = snap.get("data", {}).get("result", [])
+            if isinstance(plans, list) and plans and isinstance(plans[0], dict):
+                prior_plan_id = plans[0].get("sys_id", "")
+
+    # Build the external-agent protocol request
+    request_id = f"mcp-{_uuid.uuid4().hex[:12]}"
+    payload = {
+        "request_id": request_id,
+        "inputs": [{"type": "text", "content": message}],
+        "metadata": {"session_id": session_id} if session_id else {}
+    }
+
+    exec_result = client._request(
+        "POST",
+        f"/api/sn_aia/agenticai/v1/agent/id/{agent_id}",
+        data=payload,
+        timeout=120  # agenticai API can take up to 2 minutes to acknowledge
+    )
+
+    if not exec_result["success"]:
+        return json.dumps({
+            "success": False,
+            "error": exec_result.get("error", "Request failed"),
+            "status_code": exec_result.get("status_code"),
+            "raw": str(exec_result.get("data", ""))[:500],
+            "hint": (
+                "Common causes: "
+                "1) sn_aia.external_agents_enabled property must be true on the instance. "
+                "2) Service account needs sn_aia.admin or admin role. "
+                "3) agent_id must be a valid sn_aia_agent sys_id (use list_available_agents()). "
+                "4) HTTP 404 → agent not found or external agents not enabled. "
+                "5) HTTP 400 → check request format (inputs array required)."
+            )
+        }, indent=2)
+
+    # Parse response — be defensive: resp["result"] may be a dict, list, or missing
+    resp = exec_result.get("data") or {}
+    if isinstance(resp, str):
+        try:
+            resp = json.loads(resp)
+        except Exception:
+            resp = {}
+
+    resp_inner = resp.get("result", {}) if isinstance(resp, dict) else {}
+    if not isinstance(resp_inner, dict):
+        resp_inner = {}
+
+    new_session_id = (
+        resp_inner.get("metadata", {}).get("session_id")
+        or (resp.get("metadata", {}).get("session_id") if isinstance(resp, dict) else None)
+        or session_id
+        or ""
+    )
+
+    # IMPORTANT: The agenticai API returns an executionPlanId that is an external/API
+    # identifier — it is NOT the sn_aia_execution_plan database sys_id. The sys_id is
+    # what sn_aia_message.execution_plan references, so we must always discover it via
+    # a table query. If execution_plan_id was passed in from a prior turn it IS already
+    # the real sys_id — use it directly and skip discovery.
+    if not exec_plan_id:
+        exec_plan_id = _discover_exec_plan(client, agent_id, message, prior_plan_id)
+
+    if not exec_plan_id:
+        return json.dumps({
+            "success": False,
+            "session_id": new_session_id,
+            "error": "Could not locate the sn_aia_execution_plan record. The agent may have been invoked — check sn_aia_execution_plan for a recent record.",
+            "raw_response": str(resp)[:300]
+        }, indent=2)
+
+    # Poll for new agent messages newer than the pre-POST baseline timestamp
+    agent_response = _poll_new_agent_messages(
+        client, exec_plan_id, baseline_timestamp,
+        timeout=min(poll_timeout_seconds, 300)
+    )
+
+    return json.dumps({
+        "success": True,
+        "session_id": new_session_id,
+        "execution_plan_id": exec_plan_id,
+        "agent_response": agent_response,
+        "status": "responded" if agent_response else "no_response",
+        "hint": (
+            None if agent_response else
+            f"No response within timeout. Agent may still be processing. "
+            f"Call again with session_id='{new_session_id}' and "
+            f"execution_plan_id='{exec_plan_id}' to continue."
+        )
+    }, indent=2)
+
+
+def _discover_exec_plan(client, agent_id: str, message: str = "", prior_plan_id: str = "") -> str:
+    """
+    Discover the real sn_aia_execution_plan database sys_id after an agenticai API call.
+
+    message: the exact text sent to the agent — stored as `objective` on the plan,
+             making it the most direct and reliable lookup key.
+    prior_plan_id: sys_id of the newest plan before the POST call, used as a fallback
+                   to confirm the found plan was created after our call.
+
+    Retries up to 10 times with 3s gaps (30s total).
+    """
+    import time as _time
+    import urllib.parse as _urlparse
+
+    for attempt in range(10):
+        _time.sleep(3)
+
+        # Strategy 1: match on objective field — the platform stores the sent message
+        # as the plan's objective, making this a direct and reliable lookup.
+        if message:
+            result = client.table_get(
+                table="sn_aia_execution_plan",
+                query=f"objective={message}",
+                fields=["sys_id", "state"],
+                limit=1,
+                order_by="-sys_created_on"
+            )
+            if result.get("success"):
+                plans = result.get("data", {}).get("result", [])
+                if isinstance(plans, list) and plans and isinstance(plans[0], dict):
+                    plan_id = plans[0].get("sys_id", "")
+                    if plan_id:
+                        return plan_id
+
+        # Strategy 2: agent field + not a terminal state (when agenticai populates agent field).
+        result = client.table_get(
+            table="sn_aia_execution_plan",
+            query=f"agent={agent_id}^stateNOTINcompleted,faulted,canceled",
+            fields=["sys_id", "state"],
+            limit=1,
+            order_by="-sys_created_on"
+        )
+        if result.get("success"):
+            plans = result.get("data", {}).get("result", [])
+            if isinstance(plans, list) and plans and isinstance(plans[0], dict):
+                plan_id = plans[0].get("sys_id", "")
+                if plan_id and plan_id != prior_plan_id:
+                    return plan_id
+
+        # Strategy 3: most recently created plan that is newer than our pre-POST snapshot.
+        result = client.table_get(
+            table="sn_aia_execution_plan",
+            fields=["sys_id", "state", "agent"],
+            limit=1,
+            order_by="-sys_created_on"
+        )
+        if result.get("success"):
+            plans = result.get("data", {}).get("result", [])
+            if isinstance(plans, list) and plans and isinstance(plans[0], dict):
+                plan_id = plans[0].get("sys_id", "")
+                if plan_id and plan_id != prior_plan_id:
+                    return plan_id
+
+    return ""
+
+
+def _get_agent_baseline(client, exec_plan_id: str) -> str:
+    """
+    Get the sys_created_on of the newest agent message on a plan.
+    Called BEFORE posting so we can filter for strictly newer messages after.
+    Using a timestamp from ServiceNow itself avoids client timezone issues.
+    """
+    result = client.table_get(
+        table="sn_aia_message",
+        query=f"execution_plan={exec_plan_id}^role=agent",
+        fields=["sys_id", "sys_created_on"],
+        limit=1,
+        order_by="-sys_created_on"
+    )
+    if not result.get("success"):
+        return ""
+    msgs = result.get("data", {}).get("result", [])
+    if isinstance(msgs, list) and msgs and isinstance(msgs[0], dict):
+        return msgs[0].get("sys_created_on", "")
+    return ""
+
+
+def _poll_new_agent_messages(client, exec_plan_id: str, baseline_timestamp: str, timeout: int = 90) -> str:
+    """
+    Poll sn_aia_message for new agent messages.
+
+    baseline_timestamp: sys_created_on of the newest agent message before our POST.
+      When provided, only returns messages strictly newer — reliably excludes all
+      previously seen messages regardless of total count.
+      On Turn 1 (empty string), returns the first agent messages that appear.
+
+    Role stored value is lowercase "agent". Interactive agents keep execution plan
+    in "in_progress" — do NOT rely on plan state to detect completion.
+    """
+    import time as _time
+
+    # Build query: timestamp-filtered on Turn 2+, unfiltered on Turn 1
+    if baseline_timestamp:
+        query = f"execution_plan={exec_plan_id}^role=agent^sys_created_on>{baseline_timestamp}"
+    else:
+        query = f"execution_plan={exec_plan_id}^role=agent"
+
+    poll_interval = 3
+    elapsed = 0
+
+    while elapsed < timeout:
+        _time.sleep(poll_interval)
+        elapsed += poll_interval
+
+        msg_result = client.table_get(
+            table="sn_aia_message",
+            query=query,
+            fields=["sys_id", "role", "message", "user_message", "sys_created_on"],
+            limit=100,
+            order_by="sys_created_on"
+        )
+        if msg_result.get("success"):
+            msgs_raw = msg_result.get("data", {}).get("result", [])
+            msgs = msgs_raw if isinstance(msgs_raw, list) else []
+            if msgs:
+                texts = []
+                for m in msgs:
+                    if not isinstance(m, dict):
+                        continue
+                    raw = m.get("message") or m.get("user_message") or ""
+                    parsed = _parse_agent_message(raw)
+                    if parsed:
+                        texts.append(parsed)
+                if texts:
+                    return "\n\n".join(texts)
+
+    return ""
+
+
+def _parse_agent_message(raw) -> str:
+    """
+    Parse an sn_aia_message field into human-readable text.
+    The field is a JSON string containing either:
+      - A list of Input Collector control objects: [{"prompt":"...","choices":[...]}, ...]
+      - A plain dict with text/value/prompt keys
+      - A plain string
+    """
+    if not raw:
+        return ""
+    # If it's already a dict or list (shouldn't happen via Table API, but be safe)
+    if isinstance(raw, (dict, list)):
+        value = raw
+    else:
+        try:
+            value = json.loads(str(raw))
+        except Exception:
+            return str(raw).replace("\nReferences: null", "").strip()
+
+    if isinstance(value, list):
+        parts = []
+        for control in value:
+            if not isinstance(control, dict):
+                parts.append(str(control))
+                continue
+            text = control.get("prompt") or control.get("text") or control.get("value") or ""
+            choices = control.get("choices") or []
+            if isinstance(choices, list) and choices:
+                choice_labels = []
+                for c in choices:
+                    if isinstance(c, dict):
+                        label = c.get("label") or c.get("value") or str(c)
+                    else:
+                        label = str(c)
+                    choice_labels.append(f"  • {label}")
+                choices_str = "\n".join(choice_labels)
+                text = f"{text}\n\nChoices:\n{choices_str}" if text else f"Choices:\n{choices_str}"
+            if text:
+                parts.append(text)
+        return "\n\n---\n\n".join(parts)
+
+    if isinstance(value, dict):
+        # Return meaningful text fields only. If the dict has none of these
+        # (e.g. it's an internal error/diagnostic object with fileName/lineNumber),
+        # return empty string so the poll continues waiting for a real response.
+        text = value.get("text") or value.get("value") or value.get("prompt") or value.get("response") or ""
+        return text.replace("\nReferences: null", "").strip()
+
+    text = str(raw)
+    return text.replace("\nReferences: null", "").strip()
 
 
 # ============================================================================
@@ -9830,3 +10252,695 @@ def order_catalog_item() -> str:
      - Who it was ordered for
 
 Let's start - who is this order for?"""
+# =============================================================================
+# SECTION: CHANGE MANAGEMENT
+# =============================================================================
+
+def _resolve_change_sys_id(number_or_id: str, client) -> tuple:
+    """Resolve a change number (CHG...) or sys_id to sys_id. Returns (sys_id, error_msg)."""
+    if not number_or_id:
+        return None, "change number or sys_id is required"
+    number_or_id = number_or_id.strip()
+    if len(number_or_id) == 32 and all(c in '0123456789abcdefABCDEF' for c in number_or_id):
+        return number_or_id, None
+    result = client.table_get(
+        table="change_request",
+        query=f"number={number_or_id.upper()}",
+        fields=["sys_id", "number"],
+        limit=1
+    )
+    if not result["success"]:
+        return None, f"Failed to look up change: {result['error']}"
+    records = result["data"].get("result", [])
+    if not records:
+        return None, f"Change not found: {number_or_id}"
+    return records[0]["sys_id"], None
+
+
+@mcp.tool()
+def create_change_request(
+    short_description: str,
+    change_type: str = "normal",
+    description: str = "",
+    category: str = "",
+    risk: str = "",
+    impact: str = "",
+    assignment_group: str = "",
+    assigned_to: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    cmdb_ci: str = ""
+) -> str:
+    """
+    Create a new change request.
+
+    Args:
+        short_description: Summary of the change (required)
+        change_type: Type — standard, normal, or emergency (default: normal)
+        description: Detailed description
+        category: Change category (e.g., Hardware, Software, Network)
+        risk: Risk level — low, moderate, or high
+        impact: Impact level — 1 (High), 2 (Medium), 3 (Low)
+        assignment_group: Assignment group name or sys_id
+        assigned_to: Assignee username or sys_id
+        start_date: Planned start date (YYYY-MM-DD HH:MM:SS)
+        end_date: Planned end date (YYYY-MM-DD HH:MM:SS)
+        cmdb_ci: Configuration item name or sys_id
+
+    Returns:
+        JSON with change number and sys_id
+
+    Examples:
+        create_change_request("Upgrade database to PostgreSQL 16", change_type="normal")
+        create_change_request("Emergency patch CVE-2026-1234", change_type="emergency", risk="high")
+    """
+    import time
+    start_time = time.time()
+    client = get_client()
+
+    risk_map = {"low": "1", "moderate": "2", "medium": "2", "high": "3"}
+    body = {"short_description": short_description, "type": change_type}
+    if description: body["description"] = description
+    if category: body["category"] = category
+    if risk: body["risk"] = risk_map.get(risk.lower(), risk)
+    if impact: body["impact"] = impact
+    if assignment_group: body["assignment_group"] = assignment_group
+    if assigned_to: body["assigned_to"] = assigned_to
+    if start_date: body["start_date"] = start_date
+    if end_date: body["end_date"] = end_date
+    if cmdb_ci: body["cmdb_ci"] = cmdb_ci
+
+    result = client.table_create("change_request", body)
+    execution_time = (time.time() - start_time) * 1000
+
+    if result["success"]:
+        rec = result["data"].get("result", {})
+        return json.dumps({
+            "success": True,
+            "data": {
+                "number": rec.get("number", "unknown"),
+                "sys_id": rec.get("sys_id", ""),
+                "state": rec.get("state", ""),
+                "type": change_type
+            },
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "create_change_request"}
+        }, indent=2)
+    else:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "CREATE_FAILED", "message": result["error"]},
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "create_change_request"}
+        }, indent=2)
+
+
+@mcp.tool()
+def update_change_request(
+    sys_id_or_number: str,
+    fields_json: str
+) -> str:
+    """
+    Update fields on an existing change request.
+
+    Args:
+        sys_id_or_number: Change sys_id or number (e.g., CHG0010001)
+        fields_json: JSON object of fields to update,
+                     e.g. '{"risk": "2", "start_date": "2026-03-10 08:00:00"}'
+
+    Returns:
+        JSON confirming the update
+
+    Examples:
+        update_change_request("CHG0010001", '{"risk": "2", "assignment_group": "Network Team"}')
+        update_change_request("CHG0010001", '{"start_date": "2026-03-15 09:00:00", "end_date": "2026-03-15 17:00:00"}')
+    """
+    import time
+    start_time = time.time()
+    client = get_client()
+
+    sys_id, err = _resolve_change_sys_id(sys_id_or_number, client)
+    if err:
+        return json.dumps({"success": False, "error": {"code": "NOT_FOUND", "message": err}}, indent=2)
+
+    try:
+        fields = json.loads(fields_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"success": False, "error": {"code": "INVALID_JSON", "message": str(e)}}, indent=2)
+
+    result = client.table_update("change_request", sys_id, fields)
+    execution_time = (time.time() - start_time) * 1000
+
+    if result["success"]:
+        rec = result["data"].get("result", {})
+        return json.dumps({
+            "success": True,
+            "data": {
+                "sys_id": sys_id,
+                "number": rec.get("number", sys_id_or_number),
+                "updated_fields": list(fields.keys())
+            },
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "update_change_request"}
+        }, indent=2)
+    else:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "UPDATE_FAILED", "message": result["error"]},
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "update_change_request"}
+        }, indent=2)
+
+
+@mcp.tool()
+def list_change_requests(
+    state: str = "",
+    change_type: str = "",
+    assignment_group: str = "",
+    assigned_to: str = "",
+    search: str = "",
+    limit: int = 25
+) -> str:
+    """
+    List change requests with optional filters.
+
+    Args:
+        state: Filter by state — new, assess, authorize, scheduled, implement, review, closed, cancelled
+        change_type: Filter by type — standard, normal, emergency
+        assignment_group: Filter by group name
+        assigned_to: Filter by assignee username
+        search: Search in short_description
+        limit: Max records (default: 25)
+
+    Returns:
+        JSON list of change requests
+
+    Examples:
+        list_change_requests(state="assess")
+        list_change_requests(change_type="emergency", limit=10)
+        list_change_requests(assignment_group="Network Team", state="implement")
+    """
+    import time
+    start_time = time.time()
+    client = get_client()
+
+    state_map = {
+        "new": "-5", "assess": "-4", "authorize": "-3",
+        "scheduled": "-2", "implement": "-1", "review": "0",
+        "closed": "3", "cancelled": "4"
+    }
+
+    query_parts = []
+    if state:
+        query_parts.append(f"state={state_map.get(state.lower(), state)}")
+    if change_type:
+        query_parts.append(f"type={change_type}")
+    if assignment_group:
+        query_parts.append(f"assignment_group.name={assignment_group}")
+    if assigned_to:
+        query_parts.append(f"assigned_to.user_name={assigned_to}")
+    if search:
+        query_parts.append(f"short_descriptionLIKE{search}")
+
+    result = client.table_get(
+        table="change_request",
+        query="^".join(query_parts) if query_parts else "",
+        fields=["sys_id", "number", "short_description", "state", "type", "risk",
+                "assignment_group", "assigned_to", "start_date", "end_date", "sys_created_on"],
+        limit=limit,
+        order_by="-sys_created_on",
+        display_value="all"
+    )
+    execution_time = (time.time() - start_time) * 1000
+
+    def dv(f):
+        return f.get("display_value", "") if isinstance(f, dict) else f or ""
+
+    if result["success"]:
+        changes = [
+            {
+                "number": dv(r.get("number")),
+                "sys_id": dv(r.get("sys_id")),
+                "short_description": r.get("short_description", ""),
+                "state": dv(r.get("state")),
+                "type": dv(r.get("type")),
+                "risk": dv(r.get("risk")),
+                "assignment_group": dv(r.get("assignment_group")),
+                "assigned_to": dv(r.get("assigned_to")),
+                "start_date": dv(r.get("start_date")),
+                "end_date": dv(r.get("end_date")),
+                "created": dv(r.get("sys_created_on"))
+            }
+            for r in result["data"].get("result", [])
+        ]
+        return json.dumps({
+            "success": True,
+            "data": {"count": len(changes), "changes": changes},
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "list_change_requests"}
+        }, indent=2)
+    else:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "QUERY_FAILED", "message": result["error"]},
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "list_change_requests"}
+        }, indent=2)
+
+
+@mcp.tool()
+def get_change_request_details(sys_id_or_number: str) -> str:
+    """
+    Get full details of a change request including tasks and approval records.
+
+    Args:
+        sys_id_or_number: Change sys_id or number (e.g., CHG0010001)
+
+    Returns:
+        JSON with change details, associated tasks, and approval records
+
+    Examples:
+        get_change_request_details("CHG0010001")
+    """
+    import time
+    start_time = time.time()
+    client = get_client()
+
+    sys_id, err = _resolve_change_sys_id(sys_id_or_number, client)
+    if err:
+        return json.dumps({"success": False, "error": {"code": "NOT_FOUND", "message": err}}, indent=2)
+
+    result = client.table_get(table="change_request", sys_id=sys_id, display_value="all")
+
+    if not result["success"] or not result["data"]:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "NOT_FOUND", "message": f"Change not found: {sys_id_or_number}"}
+        }, indent=2)
+
+    def dv(f):
+        return f.get("display_value", "") if isinstance(f, dict) else f or ""
+
+    rec = result["data"].get("result", {})
+    output = {
+        "success": True,
+        "data": {
+            "number": dv(rec.get("number")),
+            "sys_id": sys_id,
+            "short_description": rec.get("short_description", ""),
+            "description": strip_html(rec.get("description", "")),
+            "state": dv(rec.get("state")),
+            "type": dv(rec.get("type")),
+            "risk": dv(rec.get("risk")),
+            "impact": dv(rec.get("impact")),
+            "category": dv(rec.get("category")),
+            "assignment_group": dv(rec.get("assignment_group")),
+            "assigned_to": dv(rec.get("assigned_to")),
+            "requested_by": dv(rec.get("requested_by")),
+            "start_date": dv(rec.get("start_date")),
+            "end_date": dv(rec.get("end_date")),
+            "cmdb_ci": dv(rec.get("cmdb_ci")),
+            "approval": dv(rec.get("approval")),
+            "work_notes": rec.get("work_notes", ""),
+            "opened_at": dv(rec.get("sys_created_on"))
+        }
+    }
+
+    # Associated change tasks
+    tasks_result = client.table_get(
+        table="change_task",
+        query=f"change_request={sys_id}",
+        fields=["sys_id", "number", "short_description", "state", "assigned_to",
+                "planned_start_date", "planned_end_date"],
+        limit=20,
+        display_value="all"
+    )
+    if tasks_result["success"]:
+        output["data"]["tasks"] = [
+            {
+                "number": dv(t.get("number")),
+                "sys_id": dv(t.get("sys_id")),
+                "short_description": t.get("short_description", ""),
+                "state": dv(t.get("state")),
+                "assigned_to": dv(t.get("assigned_to")),
+                "planned_start": dv(t.get("planned_start_date")),
+                "planned_end": dv(t.get("planned_end_date"))
+            }
+            for t in tasks_result["data"].get("result", [])
+        ]
+
+    # Approval records
+    approvals_result = client.table_get(
+        table="sysapproval_approver",
+        query=f"sysapproval={sys_id}",
+        fields=["sys_id", "approver", "state", "comments", "sys_created_on"],
+        limit=10,
+        display_value="all"
+    )
+    if approvals_result["success"]:
+        output["data"]["approvals"] = [
+            {
+                "sys_id": dv(a.get("sys_id")),
+                "approver": dv(a.get("approver")),
+                "state": dv(a.get("state")),
+                "comments": dv(a.get("comments"))
+            }
+            for a in approvals_result["data"].get("result", [])
+        ]
+
+    execution_time = (time.time() - start_time) * 1000
+    output["meta"] = {"execution_time_ms": round(execution_time, 2), "tool": "get_change_request_details"}
+    return json.dumps(output, indent=2)
+
+
+@mcp.tool()
+def add_task_to_change(
+    change_sys_id_or_number: str,
+    short_description: str,
+    description: str = "",
+    assigned_to: str = "",
+    planned_start_date: str = "",
+    planned_end_date: str = ""
+) -> str:
+    """
+    Add a task to an existing change request.
+
+    Args:
+        change_sys_id_or_number: Change sys_id or number (e.g., CHG0010001)
+        short_description: Task summary (required)
+        description: Detailed task description
+        assigned_to: Assignee username or sys_id
+        planned_start_date: Planned start (YYYY-MM-DD HH:MM:SS)
+        planned_end_date: Planned end (YYYY-MM-DD HH:MM:SS)
+
+    Returns:
+        JSON with new task number and sys_id
+
+    Examples:
+        add_task_to_change("CHG0010001", "Take database backup before migration")
+        add_task_to_change("CHG0010001", "Validate service after patch", assigned_to="john.doe")
+    """
+    import time
+    start_time = time.time()
+    client = get_client()
+
+    sys_id, err = _resolve_change_sys_id(change_sys_id_or_number, client)
+    if err:
+        return json.dumps({"success": False, "error": {"code": "NOT_FOUND", "message": err}}, indent=2)
+
+    body = {"change_request": sys_id, "short_description": short_description}
+    if description: body["description"] = description
+    if assigned_to: body["assigned_to"] = assigned_to
+    if planned_start_date: body["planned_start_date"] = planned_start_date
+    if planned_end_date: body["planned_end_date"] = planned_end_date
+
+    result = client.table_create("change_task", body)
+    execution_time = (time.time() - start_time) * 1000
+
+    if result["success"]:
+        rec = result["data"].get("result", {})
+        return json.dumps({
+            "success": True,
+            "data": {
+                "task_number": rec.get("number", "unknown"),
+                "task_sys_id": rec.get("sys_id", ""),
+                "change_sys_id": sys_id
+            },
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "add_task_to_change"}
+        }, indent=2)
+    else:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "CREATE_FAILED", "message": result["error"]},
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "add_task_to_change"}
+        }, indent=2)
+
+
+@mcp.tool()
+def submit_change_for_approval(
+    sys_id_or_number: str,
+    comments: str = ""
+) -> str:
+    """
+    Submit a change request for approval (moves state from New → Assess).
+
+    Args:
+        sys_id_or_number: Change sys_id or number (e.g., CHG0010001)
+        comments: Optional work notes to add when submitting
+
+    Returns:
+        JSON confirming state transition
+
+    Examples:
+        submit_change_for_approval("CHG0010001")
+        submit_change_for_approval("CHG0010001", "All pre-checks complete, ready for CAB review")
+    """
+    import time
+    start_time = time.time()
+    client = get_client()
+
+    sys_id, err = _resolve_change_sys_id(sys_id_or_number, client)
+    if err:
+        return json.dumps({"success": False, "error": {"code": "NOT_FOUND", "message": err}}, indent=2)
+
+    body = {"state": "-4"}  # -4 = Assess (triggers approval workflow)
+    if comments:
+        body["work_notes"] = comments
+
+    result = client.table_update("change_request", sys_id, body)
+    execution_time = (time.time() - start_time) * 1000
+
+    if result["success"]:
+        rec = result["data"].get("result", {})
+        return json.dumps({
+            "success": True,
+            "data": {
+                "sys_id": sys_id,
+                "number": rec.get("number", sys_id_or_number),
+                "new_state": "Assess",
+                "message": "Change submitted for approval — awaiting CAB/approver review."
+            },
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "submit_change_for_approval"}
+        }, indent=2)
+    else:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "STATE_TRANSITION_FAILED", "message": result["error"]},
+            "meta": {"execution_time_ms": round(execution_time, 2), "tool": "submit_change_for_approval"}
+        }, indent=2)
+
+
+@mcp.tool()
+def approve_change_request(
+    sys_id_or_number: str,
+    comments: str = ""
+) -> str:
+    """
+    Approve a change request by approving all pending approval records.
+
+    Args:
+        sys_id_or_number: Change sys_id or number (e.g., CHG0010001)
+        comments: Approval justification or notes
+
+    Returns:
+        JSON confirming how many approval records were approved
+
+    Examples:
+        approve_change_request("CHG0010001", "Risk reviewed and accepted by CAB")
+    """
+    import time
+    start_time = time.time()
+    client = get_client()
+
+    sys_id, err = _resolve_change_sys_id(sys_id_or_number, client)
+    if err:
+        return json.dumps({"success": False, "error": {"code": "NOT_FOUND", "message": err}}, indent=2)
+
+    approvals_result = client.table_get(
+        table="sysapproval_approver",
+        query=f"sysapproval={sys_id}^state=requested",
+        fields=["sys_id"],
+        limit=20
+    )
+    if not approvals_result["success"]:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "QUERY_FAILED", "message": approvals_result["error"]},
+            "meta": {"execution_time_ms": round((time.time() - start_time) * 1000, 2), "tool": "approve_change_request"}
+        }, indent=2)
+
+    approval_records = approvals_result["data"].get("result", [])
+    if not approval_records:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "NO_PENDING_APPROVALS", "message": f"No pending approvals found for {sys_id_or_number}"},
+            "meta": {"execution_time_ms": round((time.time() - start_time) * 1000, 2), "tool": "approve_change_request"}
+        }, indent=2)
+
+    approved = []
+    for approval in approval_records:
+        body = {"state": "approved"}
+        if comments:
+            body["comments"] = comments
+        upd = client.table_update("sysapproval_approver", approval["sys_id"], body)
+        if upd["success"]:
+            approved.append(approval["sys_id"])
+
+    execution_time = (time.time() - start_time) * 1000
+    return json.dumps({
+        "success": True,
+        "data": {
+            "sys_id": sys_id,
+            "number": sys_id_or_number,
+            "approvals_updated": len(approved),
+            "message": f"Approved {len(approved)} approval record(s) for {sys_id_or_number}"
+        },
+        "meta": {"execution_time_ms": round(execution_time, 2), "tool": "approve_change_request"}
+    }, indent=2)
+
+
+@mcp.tool()
+def reject_change_request(
+    sys_id_or_number: str,
+    comments: str = ""
+) -> str:
+    """
+    Reject a change request by rejecting all pending approval records.
+
+    Args:
+        sys_id_or_number: Change sys_id or number (e.g., CHG0010001)
+        comments: Rejection reason (strongly recommended)
+
+    Returns:
+        JSON confirming how many approval records were rejected
+
+    Examples:
+        reject_change_request("CHG0010001", "Insufficient testing evidence provided")
+    """
+    import time
+    start_time = time.time()
+    client = get_client()
+
+    sys_id, err = _resolve_change_sys_id(sys_id_or_number, client)
+    if err:
+        return json.dumps({"success": False, "error": {"code": "NOT_FOUND", "message": err}}, indent=2)
+
+    approvals_result = client.table_get(
+        table="sysapproval_approver",
+        query=f"sysapproval={sys_id}^state=requested",
+        fields=["sys_id"],
+        limit=20
+    )
+    if not approvals_result["success"]:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "QUERY_FAILED", "message": approvals_result["error"]},
+            "meta": {"execution_time_ms": round((time.time() - start_time) * 1000, 2), "tool": "reject_change_request"}
+        }, indent=2)
+
+    approval_records = approvals_result["data"].get("result", [])
+    if not approval_records:
+        return json.dumps({
+            "success": False,
+            "error": {"code": "NO_PENDING_APPROVALS", "message": f"No pending approvals found for {sys_id_or_number}"},
+            "meta": {"execution_time_ms": round((time.time() - start_time) * 1000, 2), "tool": "reject_change_request"}
+        }, indent=2)
+
+    rejected = []
+    for approval in approval_records:
+        body = {"state": "rejected"}
+        if comments:
+            body["comments"] = comments
+        upd = client.table_update("sysapproval_approver", approval["sys_id"], body)
+        if upd["success"]:
+            rejected.append(approval["sys_id"])
+
+    execution_time = (time.time() - start_time) * 1000
+    return json.dumps({
+        "success": True,
+        "data": {
+            "sys_id": sys_id,
+            "number": sys_id_or_number,
+            "approvals_updated": len(rejected),
+            "message": f"Rejected {len(rejected)} approval record(s) for {sys_id_or_number}"
+        },
+        "meta": {"execution_time_ms": round(execution_time, 2), "tool": "reject_change_request"}
+    }, indent=2)
+
+
+# =============================================================================
+# SECTION: ROLE-BASED TOOL PACKAGES
+# =============================================================================
+
+@mcp.tool()
+def list_tool_packages() -> str:
+    """
+    List available tool packages and which tools each role should use.
+    Configure the active package via the SNOW_TOOL_PACKAGE environment variable.
+
+    Available packages:
+      service_desk        — Incident + approval + catalog operations
+      change_coordinator  — Change management end-to-end
+      catalog_manager     — Service catalog + order management
+      ai_admin            — AI Agent building, debugging, and performance analysis
+      platform_developer  — Generic table ops + scripted REST + system tools
+      full_access         — All tools (default)
+
+    Returns:
+        JSON with package definitions and the currently active package
+    """
+    packages = {
+        "service_desk": [
+            "create_incident", "update_incident", "resolve_close_incident",
+            "get_incident_details", "list_incidents",
+            "list_pending_approvals", "approve_record", "reject_record", "get_approval_details",
+            "search_catalog_items", "get_catalog_item_details", "order_catalog_item",
+            "get_request_status", "list_my_requests", "get_user_context",
+            "upload_attachment", "list_attachments",
+            "search_servicenow_knowledge"
+        ],
+        "change_coordinator": [
+            "create_change_request", "update_change_request", "list_change_requests",
+            "get_change_request_details", "add_task_to_change",
+            "submit_change_for_approval", "approve_change_request", "reject_change_request",
+            "list_pending_approvals", "approve_record", "reject_record",
+            "get_form_mandatory_fields", "validate_record_data",
+            "snow_query", "snow_get_record", "snow_update_record",
+            "search_servicenow_knowledge"
+        ],
+        "catalog_manager": [
+            "list_catalog_items", "search_catalog_items", "get_catalog_item_details",
+            "lookup_reference_field", "get_user_context",
+            "order_catalog_item", "get_request_status", "list_my_requests",
+            "list_pending_approvals", "approve_record", "reject_record",
+            "upload_attachment", "list_attachments"
+        ],
+        "ai_admin": [
+            "list_ai_agents", "get_agent_details", "list_agent_tools",
+            "create_ai_agent", "update_ai_agent", "delete_ai_agent", "clone_ai_agent",
+            "add_tool_to_agent", "remove_tool_from_agent",
+            "create_tool", "update_tool", "delete_tool",
+            "list_agentic_workflows", "create_agentic_workflow", "update_agentic_workflow",
+            "list_trigger_configurations", "create_trigger", "update_trigger",
+            "query_execution_plans", "query_execution_tasks", "get_execution_details",
+            "analyze_conversation_performance", "compare_conversation_performance",
+            "analyze_conversation_trends", "query_agent_messages",
+            "query_generative_ai_logs", "query_generative_ai_logs_detailed",
+            "health_check", "cleanup_agent_configs"
+        ],
+        "platform_developer": [
+            "snow_query", "snow_get_record", "snow_create_record", "snow_update_record",
+            "snow_delete_record", "snow_count", "snow_aggregate", "snow_table_schema",
+            "execute_scripted_rest_api", "query_syslog",
+            "query_flow_contexts", "query_flow_logs", "get_flow_context_details",
+            "get_form_mandatory_fields", "validate_record_data",
+            "query_system_properties", "snow_test_connection", "health_check"
+        ],
+        "full_access": ["all tools"]
+    }
+
+    active_package = os.getenv("SNOW_TOOL_PACKAGE", "full_access")
+
+    return json.dumps({
+        "success": True,
+        "data": {
+            "active_package": active_package,
+            "active_tools": packages.get(active_package, packages["full_access"]),
+            "all_packages": packages
+        },
+        "usage": "Set SNOW_TOOL_PACKAGE env var to restrict tools for a specific role."
+    }, indent=2)
